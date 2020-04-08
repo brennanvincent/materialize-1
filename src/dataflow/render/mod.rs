@@ -37,7 +37,7 @@ use super::source;
 use super::source::FileReadStyle;
 use super::source::SourceToken;
 use crate::arrangement::manager::{TraceManager, WithDrop};
-use crate::decode::{decode_avro_values, decode_key_values, decode_values, drop_key};
+use crate::decode::{decode_avro_values, decode_key_values, decode_values};
 use crate::logging::materialized::{Logger, MaterializedEvent};
 use crate::server::LocalInput;
 use crate::server::{TimestampChanges, TimestampHistories};
@@ -255,6 +255,7 @@ pub(crate) fn build_dataflow<A: Allocate>(
                                     ExternalSourceConnector::Kafka(c) => {
                                         // Distribute read responsibility among workers.
                                         use differential_dataflow::hashable::Hashable;
+                                        use timely::dataflow::operators::Map;
                                         let hash = src_id.hashed() as usize;
                                         let read_from_kafka = hash % worker_peers == worker_index;
                                         let (source, capability) = source::kafka(
@@ -268,8 +269,13 @@ pub(crate) fn build_dataflow<A: Allocate>(
                                             consistency,
                                             read_from_kafka,
                                         );
-                                        let source = drop_key(&source);
-                                        (source, capability)
+                                        // drop the key that came from the kafka source
+                                        (
+                                            source.map(|((_key, payload), aux_num)| {
+                                                (payload, aux_num)
+                                            }),
+                                            capability,
+                                        )
                                     }
                                     ExternalSourceConnector::Kinesis(c) => {
                                         // Distribute read responsibility among workers.
