@@ -65,17 +65,24 @@ pub fn describe_statement(
         | Statement::Rollback { .. }
         | Statement::Commit { .. } => (None, vec![]),
 
-        Statement::Explain { stage, .. } => (
+        Statement::Explain {
+            stage, explainee, ..
+        } => (
             Some(RelationDesc::empty().add_column(
                 match stage {
                     ExplainStage::Sql => "Sql",
                     ExplainStage::RawPlan => "Raw Plan",
                     ExplainStage::DecorrelatedPlan => "Decorrelated Plan",
-                    ExplainStage::OptimizedPlan{..} => "Optimized Plan",
+                    ExplainStage::OptimizedPlan { .. } => "Optimized Plan",
                 },
                 ScalarType::String,
             )),
-            vec![],
+            match explainee {
+                Explainee::Query(q) => {
+                    describe_statement(catalog, session, Statement::Query(Box::new(q)))?.1
+                }
+                _ => vec![],
+            },
         ),
 
         Statement::ShowCreateView { .. } => (
@@ -160,8 +167,8 @@ pub fn describe_statement(
                     if ObjectType::View == object_type {
                         relation_desc = relation_desc.add_column("QUERYABLE", ScalarType::Bool);
                     }
-                    if !materialized &&
-                        (ObjectType::View == object_type || ObjectType::Source == object_type)
+                    if !materialized
+                        && (ObjectType::View == object_type || ObjectType::Source == object_type)
                     {
                         relation_desc = relation_desc.add_column("MATERIALIZED", ScalarType::Bool);
                     }
@@ -206,7 +213,10 @@ pub fn describe_statement(
                 query::plan_root_query(scx, *query, QueryLifetime::OneShot)?;
             (Some(desc), param_types)
         }
-        Statement::CreateTable { .. } => bail!("CREATE TABLE statements are not supported. Try CREATE SOURCE or CREATE [MATERIALIZED] VIEW instead."),
+        Statement::CreateTable { .. } => bail!(
+            "CREATE TABLE statements are not supported. \
+             Try CREATE SOURCE or CREATE [MATERIALIZED] VIEW instead."
+        ),
         _ => bail!("unsupported SQL statement: {:?}", stmt),
     })
 }
@@ -569,7 +579,7 @@ fn handle_show_columns(
             Row::pack(&[
                 Datum::String(name.as_deref().unwrap_or("?")),
                 Datum::String(if typ.nullable { "YES" } else { "NO" }),
-                Datum::String(pgrepr::Type::from(typ.scalar_type).name()),
+                Datum::String(pgrepr::Type::from(&typ.scalar_type).name()),
             ])
         })
         .collect();
@@ -949,8 +959,8 @@ pub async fn purify_statement(mut stmt: Statement) -> Result<Statement, failure:
             }
             Connector::AvroOcf { path, .. } => {
                 let path = path.clone();
-                let f = tokio::fs::File::open(path).await?;
-                let r = avro::Reader::new(f).await?;
+                let f = std::fs::File::open(path)?;
+                let r = avro::Reader::new(f)?;
                 if !with_options_map.contains_key("reader_schema") {
                     let schema = serde_json::to_string(r.writer_schema()).unwrap();
                     with_options.push(sql_parser::ast::SqlOption {
@@ -1483,7 +1493,7 @@ fn handle_explain(
     stage: ExplainStage,
     explainee: Explainee,
     options: ExplainOptions,
-    _params: &Params,
+    params: &Params,
 ) -> Result<Plan, failure::Error> {
     let is_view = if let Explainee::View(_) = explainee {
         true
@@ -1525,6 +1535,7 @@ fn handle_explain(
     } else {
         Some(finishing)
     };
+    sql_expr.bind_parameters(&params);
     let expr = sql_expr.clone().decorrelate();
     Ok(Plan::ExplainPlan {
         sql,

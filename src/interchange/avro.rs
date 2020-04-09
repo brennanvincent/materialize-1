@@ -15,7 +15,6 @@ use std::iter;
 use byteorder::{BigEndian, ByteOrder, NetworkEndian, WriteBytesExt};
 use chrono::Timelike;
 use failure::bail;
-use futures::executor::block_on;
 use itertools::Itertools;
 use serde_json::json;
 use sha2::Sha256;
@@ -521,23 +520,23 @@ impl Decoder {
                     // The record is laid out such that we can extract the `before` and
                     // `after` fields without decoding the entire record.
                     let before = extract_row(
-                        block_on(avro::from_avro_datum(&schema, &mut bytes))?,
+                        avro::from_avro_datum(&schema, &mut bytes)?,
                         true,
                         iter::once(Datum::Int64(-1)),
                     )?;
                     let after = extract_row(
-                        block_on(avro::from_avro_datum(&schema, &mut bytes))?,
+                        avro::from_avro_datum(&schema, &mut bytes)?,
                         true,
                         iter::once(Datum::Int64(1)),
                     )?;
                     DiffPair { before, after }
                 } else {
-                    let val = block_on(avro::from_avro_datum(resolved_schema, &mut bytes))?;
+                    let val = avro::from_avro_datum(resolved_schema, &mut bytes)?;
                     extract_debezium_slow(val)?
                 }
             }
             EnvelopeType::Upsert | EnvelopeType::None => {
-                let val = block_on(avro::from_avro_datum(resolved_schema, &mut bytes))?;
+                let val = avro::from_avro_datum(resolved_schema, &mut bytes)?;
                 let row = extract_row(val, self.envelope == EnvelopeType::Upsert, iter::empty())?;
                 DiffPair {
                     before: None,
@@ -560,7 +559,7 @@ impl Decoder {
 fn build_schema(desc: &RelationDesc) -> Schema {
     let mut fields = Vec::new();
     for (name, typ) in desc.iter() {
-        let mut field_type = match typ.scalar_type {
+        let mut field_type = match &typ.scalar_type {
             ScalarType::Unknown => json!("null"),
             ScalarType::Bool => json!("boolean"),
             ScalarType::Int32 => json!("int"),
@@ -597,6 +596,7 @@ fn build_schema(desc: &RelationDesc) -> Schema {
                 "type": "string",
                 "connect.name": "io.debezium.data.Json",
             }),
+            ScalarType::Array(_t) => unimplemented!("jamii/array"),
         };
         if typ.nullable && typ.scalar_type != ScalarType::Unknown {
             field_type = json!(["null", field_type]);
@@ -719,7 +719,7 @@ impl Encoder {
                 if typ.nullable && typ.scalar_type != ScalarType::Unknown && datum.is_null() {
                     return (name, Value::Union(0, Box::new(Value::Null)));
                 }
-                let mut val = match typ.scalar_type {
+                let mut val = match &typ.scalar_type {
                     ScalarType::Unknown => Value::Null,
                     ScalarType::Bool => Value::Boolean(datum.unwrap_bool()),
                     ScalarType::Int32 => Value::Int(datum.unwrap_int32()),
@@ -728,8 +728,8 @@ impl Encoder {
                     ScalarType::Float64 => Value::Double(datum.unwrap_float64()),
                     ScalarType::Decimal(p, s) => Value::Decimal(DecimalValue {
                         unscaled: datum.unwrap_decimal().as_i128().to_be_bytes().to_vec(),
-                        precision: p.into(),
-                        scale: s.into(),
+                        precision: (*p).into(),
+                        scale: (*s).into(),
                     }),
                     ScalarType::Date => Value::Date(datum.unwrap_date()),
                     ScalarType::Time => Value::Long({
@@ -755,6 +755,7 @@ impl Encoder {
                     ScalarType::Jsonb => {
                         Value::Json(Jsonb::from_datum(datum.clone()).into_serde_json())
                     }
+                    ScalarType::Array(_t) => unimplemented!("jamii/array"),
                 };
                 if typ.nullable && typ.scalar_type != ScalarType::Unknown {
                     val = Value::Union(1, Box::new(val));
