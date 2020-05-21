@@ -2694,6 +2694,7 @@ dependencies = [
 name = "repr"
 version = "0.1.0"
 dependencies = [
+ "avro",
  "chrono",
  "criterion",
  "failure",

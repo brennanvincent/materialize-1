@@ -40,6 +40,18 @@ pub struct DecimalValue {
     pub scale: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)] // Can't be Eq because there are floats
+pub enum Scalar {
+    Null,
+    Boolean(bool),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Date(NaiveDate),
+    Timestamp(NaiveDateTime),
+}
+
 /// Represents any valid Avro value
 /// More information about Avro values can be found in the
 /// [Avro Specification](https://avro.apache.org/docs/current/spec.html#schemas)

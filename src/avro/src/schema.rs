@@ -255,9 +255,9 @@ pub enum SchemaPiece {
     /// The two schemas may have different values and the values may be in a different order.
     ResolveEnum {
         doc: Documentation,
-        /// Symbols in the reader schema if they exist in the writer schema,
-        /// or `None` otherwise.
-        symbols: Vec<Option<String>>,
+        /// Symbols in the writer schema along with their index in the reader schema,
+        /// or `None` if they don't exist in the reader schema..
+        symbols: Vec<Option<(String, usize)>>,
         // TODO(brennan) - These should support default values
     },
 }

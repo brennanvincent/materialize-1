@@ -526,6 +526,10 @@ impl<'a> DatumList<'a> {
     pub fn data(&self) -> &'a [u8] {
         &self.data
     }
+    // XXX
+    pub unsafe fn from_data(data: &'a [u8]) -> DatumList<'a> {
+        DatumList { data }
+    }
 }
 
 impl<'a> IntoIterator for &'a DatumList<'a> {
@@ -563,6 +567,10 @@ impl<'a> DatumDict<'a> {
     /// For debugging only
     pub fn data(&self) -> &'a [u8] {
         &self.data
+    }
+    // XXX
+    pub unsafe fn from_data(data: &'a [u8]) -> DatumDict<'a> {
+        DatumDict { data }
     }
 }
 

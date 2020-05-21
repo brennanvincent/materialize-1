@@ -3,6 +3,7 @@
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
 //
+
 // As of the Change Date specified in that file, in accordance with
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
@@ -11,7 +12,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt;
-use std::iter;
+use std::{io::Read, iter};
 
 use byteorder::{BigEndian, ByteOrder, NetworkEndian, WriteBytesExt};
 use chrono::Timelike;
@@ -25,10 +26,10 @@ use avro::schema::{
     resolve_schemas, RecordField, Schema, SchemaFingerprint, SchemaNode, SchemaPiece,
     SchemaPieceOrNamed,
 };
-use avro::types::{DecimalValue, Value};
-use repr::adt::decimal::{Significand, MAX_DECIMAL_PRECISION};
-use repr::adt::jsonb::{JsonbPacker, JsonbRef};
-use repr::{ColumnType, Datum, RelationDesc, RelationType, Row, RowPacker, ScalarType};
+use avro::types::{DecimalValue, Scalar, Value};
+use repr::decimal::{Significand, MAX_DECIMAL_PRECISION};
+use repr::jsonb::{JsonbPacker, JsonbRef};
+use repr::{ColumnType, Datum, OwnedDatum, RelationDesc, RelationType, Row, RowPacker, ScalarType};
 
 use crate::error::Result;
 
@@ -440,6 +441,318 @@ impl BinlogSchemaIndices {
             source_row_idx,
             source_snapshot_idx,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DebeziumDecodeState2 {
+    Start,
+    InRootRecord,
+    AtEnvelopeField,
+    InEnvelopeRecord,
+    AtBeforeField,
+    InBeforeRecord,
+    AtBeforeSubfield(usize),
+    AtBeforeUnion {
+        field_idx: usize,
+        variant_idx: usize,
+    },
+    AtAfterField,
+    AtAfterUnion {
+        field_idx: usize,
+        variant_idx: usize,
+    },
+    InAfterRecord,
+    AtAfterSubfield(usize),
+    AtSourceField,
+    InSourceRecord,
+    AtSourceFile,
+    AtSourcePos,
+    AtSourceRow,
+    AtSourceSnapshot,
+    AtSourceOther,
+    InSourceOther {
+        depth: usize,
+    },
+    AtOtherField,
+    InOtherField {
+        depth: usize,
+    },
+    End,
+}
+
+struct RowState {
+    buf: Option<RowPacker>,
+    next: usize,
+    stash: Vec<(usize, OwnedDatum)>,
+    json_stash: Vec<(usize, Jsonb)>,
+}
+
+struct DebeziumAvroDecoder<'a> {
+    state: DebeziumDecodeState2,
+    before_state: &'a mut RowState,
+    before_present: bool,
+    after_state: &'a mut RowState,
+    after_present: bool,
+    file_buf: &'a mut Vec<u8>,
+    pos: Option<usize>,
+    row: Option<usize>,
+    snapshot: Option<bool>,
+    scratch: &'a mut Vec<u8>,
+}
+
+impl<'a> DebeziumAvroDecoder<'a> {}
+
+// This is a macro, instead of a method, because we sometimes
+// want to call it while the datum is borrowing from self.
+macro_rules! give_datum {
+    ($self:ident, $datum:expr) => {
+        let datum: Datum = $datum;
+        let (row_state, datum_idx) = match $self.state {
+            DebeziumDecodeState2::AtBeforeSubfield(idx) => (&mut $self.before_state, idx),
+            DebeziumDecodeState2::AtAfterSubfield(idx) => (&mut $self.after_state, idx),
+            _ => todo!(),
+        };
+        if row_state.next == datum_idx {
+            // The happy, in-order case - just write directly into the row. No need to stash anything anywhere.
+            row_state.buf.unwrap().extend(Some(datum));
+            row_state.next += 1;
+        } else {
+            // This is the case when fields are in a different order in the reader schema from
+            // the writer schema.
+            //
+            // TODO - do something smart to avoid the allocations/clones here if people complain. It won't matter much
+            // for scalar columns. Maybe for non-scalars (e.g. string) we can create one allocation per column and reuse it.
+            row_state.stash.push((datum_idx, datum.to_owned()));
+        }
+    };
+}
+impl<'a> AvroDecode for DebeziumAvroDecoder<'a> {
+    fn begin_record(&mut self) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match self.state {
+            Start => InRootRecord,
+            AtEnvelopeField => InEnvelopeRecord,
+            AtBeforeField => InBeforeRecord,
+            AtAfterField => InAfterRecord,
+            AtAfterSubfield(_) | AtBeforeSubfield(_) => {
+                bail!("Nested record types are not yet supported in Materialize.");
+            }
+            AtSourceField => InSourceRecord,
+            AtSourceFile | AtSourcePos | AtSourceRow | AtSourceSnapshot => {
+                bail!("Record not expected at position {:?}", self.state);
+            }
+            AtSourceOther => InSourceOther { depth: 0 },
+            InSourceOther { depth } => InSourceOther { depth: depth + 1 },
+            AtOtherField => InOtherField { depth: 0 },
+            InOtherField { depth } => InOtherField { depth: depth + 1 },
+            End | InRootRecord | InEnvelopeRecord | InBeforeRecord | InAfterRecord
+            | InSourceRecord => unreachable!(),
+            _ => todo!(),
+        };
+        Ok(())
+    }
+    fn record_field(&mut self, name: &str, position: usize) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match (name, self.state) {
+            ("envelope", InRootRecord) => AtEnvelopeField,
+            ("before", InEnvelopeRecord) => {
+                self.before_present = true;
+                AtBeforeField
+            }
+            ("after", InEnvelopeRecord) => {
+                self.after_present = true;
+                AtAfterField
+            }
+            (_, InEnvelopeRecord) => AtOtherField,
+            (_, InBeforeRecord) => AtBeforeSubfield(position),
+            (_, InAfterRecord) => AtAfterSubfield(position),
+            ("file", InSourceRecord) => AtSourceFile,
+            ("pos", InSourceRecord) => AtSourcePos,
+            ("row", InSourceRecord) => AtSourceRow,
+            ("snapshot", InSourceRecord) => AtSourceSnapshot,
+            (_, InSourceRecord) => AtSourceOther,
+            _ => bail!("Unexpected field {} in state {:?}", name, self.state),
+        };
+        Ok(())
+    }
+    fn end_record(&mut self) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match self.state {
+            InRootRecord => End,
+            InBeforeRecord | InAfterRecord | InSourceRecord => InRootRecord,
+            InSourceOther { depth } => {
+                if depth > 0 {
+                    InSourceOther { depth: depth - 1 }
+                } else {
+                    InSourceRecord
+                }
+            }
+            InOtherField { depth } => {
+                if depth > 0 {
+                    InOtherField { depth: depth - 1 }
+                } else {
+                    InRootRecord
+                }
+            }
+            Start | AtEnvelopeField | AtBeforeField | AtBeforeSubfield(_) | AtAfterField
+            | AtAfterSubfield(_) | AtSourceField | AtSourceFile | AtSourcePos | AtSourceRow
+            | AtSourceSnapshot | AtSourceOther | AtOtherField | End => unreachable!(),
+            _ => todo!(),
+        };
+        Ok(())
+    }
+    fn union_branch(&mut self, variant_idx: usize) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match self.state {
+            // look through the union
+            AtBeforeField | AtAfterField => self.state,
+            AtBeforeSubfield(field_idx) => AtBeforeUnion {
+                field_idx,
+                variant_idx,
+            },
+            AtAfterSubfield(field_idx) => AtAfterUnion {
+                field_idx,
+                variant_idx,
+            },
+            AtSourceOther | InSourceOther { .. } | AtOtherField | InOtherField { .. } => self.state,
+            _ => todo!(),
+        };
+        Ok(())
+    }
+    fn begin_array(&mut self) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match self.state {
+            AtSourceOther => InSourceOther { depth: 0 },
+            InSourceOther { depth } => InSourceOther { depth: depth + 1 },
+            AtOtherField => InOtherField { depth: 0 },
+            InOtherField { depth } => InOtherField { depth: depth + 1 },
+            _ => bail!("Unexpected array"),
+        };
+        Ok(())
+    }
+    fn end_array(&mut self) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match self.state {
+            InSourceOther { depth } => {
+                if depth > 0 {
+                    InSourceOther { depth: depth - 1 }
+                } else {
+                    InSourceRecord
+                }
+            }
+            InOtherField { depth } => {
+                if depth > 0 {
+                    InOtherField { depth: depth - 1 }
+                } else {
+                    InRootRecord
+                }
+            }
+            _ => unreachable!(),
+        };
+        Ok(())
+    }
+    fn begin_map(&mut self) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match self.state {
+            AtSourceOther => InSourceOther { depth: 0 },
+            InSourceOther { depth } => InSourceOther { depth: depth + 1 },
+            AtOtherField => InOtherField { depth: 0 },
+            InOtherField { depth } => InOtherField { depth: depth + 1 },
+            _ => bail!("Unexpected map"),
+        };
+        Ok(())
+    }
+    fn end_map(&mut self) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        self.state = match self.state {
+            InSourceOther { depth } => {
+                if depth > 0 {
+                    InSourceOther { depth: depth - 1 }
+                } else {
+                    InSourceRecord
+                }
+            }
+            InOtherField { depth } => {
+                if depth > 0 {
+                    InOtherField { depth: depth - 1 }
+                } else {
+                    InRootRecord
+                }
+            }
+            _ => unreachable!(),
+        };
+        Ok(())
+    }
+    fn map_key<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b str, R>) -> Result<()> {
+        Ok(())
+    }
+    fn enum_variant(&mut self, symbol: &str, idx: usize) -> Result<()> {
+        self.string(ValueOrReader::<&str, &[u8]>::Value(symbol))
+    }
+    fn scalar(&mut self, s: Scalar) -> Result<()> {
+        give_datum!(self, s.into());
+        Ok(())
+    }
+    fn decimal<'b, R: Read + Skip>(
+        &mut self,
+        precision: usize,
+        scale: usize,
+        r: ValueOrReader<'b, &'b [u8], R>,
+    ) -> Result<()> {
+        todo!()
+    }
+    fn bytes<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<()> {
+        let d = match r {
+            ValueOrReader::Value(bytes) => Datum::Bytes(bytes),
+            ValueOrReader::Reader { len, r } => {
+                self.scratch.resize_with(len, Default::default);
+                r.read_exact(&mut self.scratch);
+                Datum::Bytes(&self.scratch)
+            }
+        };
+        give_datum!(self, d);
+        Ok(())
+    }
+    fn string<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b str, R>) -> Result<()> {
+        let d = match r {
+            ValueOrReader::Value(s) => Datum::String(s),
+            ValueOrReader::Reader { len, r } => {
+                self.scratch.resize_with(len, Default::default);
+                r.read_exact(&mut self.scratch);
+                let s = std::str::from_utf8(&self.scratch)?;
+                Datum::String(s)
+            }
+        };
+        give_datum!(self, d);
+        Ok(())
+    }
+    fn json<'b, R: Read + Skip>(
+        &mut self,
+        r: ValueOrReader<'b, &'b serde_json::Value, R>,
+    ) -> Result<()> {
+        match r {
+            ValueOrReader::Value(v) => {
+                let j = Jsonb::new(v)?;
+                let (row_state, datum_idx) = match self.state {
+                    DebeziumDecodeState2::AtBeforeSubfield(idx) => (&mut self.before_state, idx),
+                    DebeziumDecodeState2::AtAfterSubfield(idx) => (&mut self.after_state, idx),
+                    _ => todo!(),
+                };
+                if row_state.next == datum_idx {
+                    let buf = row_state.buf.take().unwrap();
+                    let buf = j.pack_into(buf);
+                    row_state.buf = Some(buf);
+                    row_state.next += 1;
+                } else {
+                    row_state.json_stash.push((datum_idx, datum.to_owned()));
+                }
+            }
+            ValueOrReader::Reader { len, r } => {}
+        };
+    }
+    fn fixed<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<()> {
+        todo!()
     }
 }
 

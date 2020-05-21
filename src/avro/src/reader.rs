@@ -431,13 +431,7 @@ impl<'a> SchemaResolver<'a> {
                     .collect::<HashMap<_, _>>();
                 let symbols = w_symbols
                     .iter()
-                    .map(|s| {
-                        if r_map.contains_key(&s) {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
+                    .map(|s| r_map.get(s).map(|i| (s.clone(), *i)))
                     .collect();
                 SchemaPiece::ResolveEnum {
                     doc: doc.clone(),
