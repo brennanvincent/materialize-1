@@ -30,6 +30,7 @@ use avro::{
     types::{DecimalValue, Scalar, Value},
     AvroDecode, Skip, ValueOrReader,
 };
+
 use repr::adt::decimal::{Significand, MAX_DECIMAL_PRECISION};
 use repr::adt::jsonb::{Jsonb, JsonbPacker, JsonbRef};
 use repr::{ColumnType, Datum, OwnedDatum, RelationDesc, RelationType, Row, RowPacker, ScalarType};
@@ -484,27 +485,100 @@ enum DebeziumDecodeState2 {
     End,
 }
 
+enum StashItem {
+    OwnedDatum(OwnedDatum),
+    Jsonb(Jsonb),
+}
+
 struct RowState {
     buf: Option<RowPacker>,
     next: usize,
-    stash: Vec<(usize, OwnedDatum)>,
-    json_stash: Vec<(usize, Jsonb)>,
+    stash: Vec<(usize, StashItem)>,
 }
 
-struct DebeziumAvroDecoder<'a> {
+impl RowState {
+    fn new() -> Self {
+        Self {
+            buf: Some(RowPacker::new()),
+            next: 0,
+            stash: vec![],
+        }
+    }
+    fn finish(&mut self) -> Row {
+        let buf = self.buf.as_mut().unwrap();
+        self.stash.sort_unstable_by_key(|(idx, _)| *idx);
+        for (idx, item) in self.stash.drain(..) {
+            assert!(idx == self.next);
+            self.next += 1;
+            match &item {
+                StashItem::OwnedDatum(od) => buf.push(od.into()),
+                StashItem::Jsonb(j) => todo!(),
+            }
+        }
+        self.next = 0;
+        buf.finish_and_reuse()
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.buf.is_some()
+            && self.buf.as_ref().unwrap().data().is_empty()
+            && self.next == 0
+            && self.stash.is_empty()
+    }
+}
+
+struct DebeziumAvroDecoder {
     state: DebeziumDecodeState2,
-    before_state: &'a mut RowState,
+    before_state: RowState,
     before_present: bool,
-    after_state: &'a mut RowState,
+    after_state: RowState,
     after_present: bool,
-    file_buf: &'a mut Vec<u8>,
+    file_buf: Vec<u8>,
     pos: Option<usize>,
     row: Option<usize>,
     snapshot: Option<bool>,
-    scratch: &'a mut Vec<u8>,
+    scratch: Vec<u8>,
 }
 
-impl<'a> DebeziumAvroDecoder<'a> {}
+impl DebeziumAvroDecoder {
+    fn finish(&mut self) -> DiffPair<Row> {
+        let before = if self.before_present {
+            Some(self.before_state.finish())
+        } else {
+            None
+        };
+        let after = if self.after_present {
+            Some(self.after_state.finish())
+        } else {
+            None
+        };
+        assert!(self.before_state.is_clean() && self.after_state.is_clean());
+        self.state = DebeziumDecodeState2::Start;
+        self.before_present = false;
+        self.after_present = false;
+        self.file_buf.clear();
+        self.pos = None;
+        self.row = None;
+        self.snapshot = None;
+        self.scratch.clear();
+        DiffPair { before, after }
+    }
+
+    fn new() -> Self {
+        Self {
+            state: DebeziumDecodeState2::Start,
+            before_state: RowState::new(),
+            before_present: false,
+            after_state: RowState::new(),
+            after_present: false,
+            file_buf: vec![],
+            pos: None,
+            row: None,
+            snapshot: None,
+            scratch: vec![],
+        }
+    }
+}
 
 // This is a macro, instead of a method, because we sometimes
 // want to call it while the datum is borrowing from self.
@@ -526,11 +600,16 @@ macro_rules! give_datum {
             //
             // TODO - do something smart to avoid the allocations/clones here if people complain. It won't matter much
             // for scalar columns. Maybe for non-scalars (e.g. string) we can create one allocation per column and reuse it.
-            row_state.stash.push((datum_idx, datum.to_owned()));
+            row_state.stash.push((datum_idx, StashItem::OwnedDatum(datum.to_owned())));
+        }
+        $self.state = match $self.state {
+            DebeziumDecodeState2::AtBeforeSubfield(_) => DebeziumDecodeState2::InBeforeRecord,
+            DebeziumDecodeState2::AtAfterSubfield(_) => DebeziumDecodeState2::InAfterRecord,
+            _ => unreachable!()
         }
     };
 }
-impl<'a> AvroDecode for DebeziumAvroDecoder<'a> {
+impl AvroDecode for DebeziumAvroDecoder {
     fn begin_record(&mut self) -> Result<()> {
         use DebeziumDecodeState2::*;
         self.state = match self.state {
@@ -694,6 +773,10 @@ impl<'a> AvroDecode for DebeziumAvroDecoder<'a> {
         self.string(ValueOrReader::<&str, &[u8]>::Value(symbol))
     }
     fn scalar(&mut self, s: Scalar) -> Result<()> {
+        use DebeziumDecodeState2::*;
+        match (self.state, s) {
+//            (AtSourcePos, Scalar::Int(i)) => self.k
+        }
         give_datum!(self, s.into());
         Ok(())
     }
@@ -710,7 +793,7 @@ impl<'a> AvroDecode for DebeziumAvroDecoder<'a> {
             ValueOrReader::Value(bytes) => Datum::Bytes(bytes),
             ValueOrReader::Reader { len, r } => {
                 self.scratch.resize_with(len, Default::default);
-                r.read_exact(&mut self.scratch);
+                r.read_exact(&mut self.scratch)?;
                 Datum::Bytes(&self.scratch)
             }
         };
@@ -722,7 +805,7 @@ impl<'a> AvroDecode for DebeziumAvroDecoder<'a> {
             ValueOrReader::Value(s) => Datum::String(s),
             ValueOrReader::Reader { len, r } => {
                 self.scratch.resize_with(len, Default::default);
-                r.read_exact(&mut self.scratch);
+                r.read_exact(&mut self.scratch)?;
                 let s = std::str::from_utf8(&self.scratch)?;
                 Datum::String(s)
             }
