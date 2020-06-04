@@ -26,9 +26,12 @@ use avro::schema::{
     resolve_schemas, RecordField, Schema, SchemaFingerprint, SchemaNode, SchemaPiece,
     SchemaPieceOrNamed,
 };
-use avro::types::{DecimalValue, Scalar, Value};
-use repr::decimal::{Significand, MAX_DECIMAL_PRECISION};
-use repr::jsonb::{JsonbPacker, JsonbRef};
+use avro::{
+    types::{DecimalValue, Scalar, Value},
+    AvroDecode, Skip, ValueOrReader,
+};
+use repr::adt::decimal::{Significand, MAX_DECIMAL_PRECISION};
+use repr::adt::jsonb::{Jsonb, JsonbPacker, JsonbRef};
 use repr::{ColumnType, Datum, OwnedDatum, RelationDesc, RelationType, Row, RowPacker, ScalarType};
 
 use crate::error::Result;
@@ -515,7 +518,7 @@ macro_rules! give_datum {
         };
         if row_state.next == datum_idx {
             // The happy, in-order case - just write directly into the row. No need to stash anything anywhere.
-            row_state.buf.unwrap().extend(Some(datum));
+            row_state.buf.as_mut().unwrap().extend(Some(datum));
             row_state.next += 1;
         } else {
             // This is the case when fields are in a different order in the reader schema from
@@ -731,28 +734,10 @@ impl<'a> AvroDecode for DebeziumAvroDecoder<'a> {
         &mut self,
         r: ValueOrReader<'b, &'b serde_json::Value, R>,
     ) -> Result<()> {
-        match r {
-            ValueOrReader::Value(v) => {
-                let j = Jsonb::new(v)?;
-                let (row_state, datum_idx) = match self.state {
-                    DebeziumDecodeState2::AtBeforeSubfield(idx) => (&mut self.before_state, idx),
-                    DebeziumDecodeState2::AtAfterSubfield(idx) => (&mut self.after_state, idx),
-                    _ => todo!(),
-                };
-                if row_state.next == datum_idx {
-                    let buf = row_state.buf.take().unwrap();
-                    let buf = j.pack_into(buf);
-                    row_state.buf = Some(buf);
-                    row_state.next += 1;
-                } else {
-                    row_state.json_stash.push((datum_idx, datum.to_owned()));
-                }
-            }
-            ValueOrReader::Reader { len, r } => {}
-        };
+        todo!()
     }
     fn fixed<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<()> {
-        todo!()
+        bail!("`fixed` types are not supported.")
     }
 }
 

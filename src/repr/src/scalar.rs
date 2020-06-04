@@ -19,6 +19,8 @@ use crate::adt::decimal::Significand;
 use crate::adt::interval::Interval;
 use crate::{ColumnType, DatumDict, DatumList};
 
+use avro::types::Scalar as AvroScalar;
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum OwnedDatum {
     Datum(Datum<'static>),
@@ -36,6 +38,22 @@ impl<'a> From<&'a OwnedDatum> for Datum<'a> {
             OwnedDatum::String(s) => Datum::String(&s),
             OwnedDatum::List(data) => Datum::List(unsafe { DatumList::from_data(data) }),
             OwnedDatum::Dict(data) => Datum::Dict(unsafe { DatumDict::from_data(data) }),
+        }
+    }
+}
+
+impl<'a> From<AvroScalar> for Datum<'a> {
+    fn from(s: AvroScalar) -> Self {
+        match s {
+            AvroScalar::Null => Datum::Null,
+            AvroScalar::Boolean(true) => Datum::True,
+            AvroScalar::Boolean(false) => Datum::False,
+            AvroScalar::Int(i) => Datum::Int32(i),
+            AvroScalar::Long(l) => Datum::Int64(l),
+            AvroScalar::Float(f) => Datum::Float32(OrderedFloat(f)),
+            AvroScalar::Double(d) => Datum::Float64(OrderedFloat(d)),
+            AvroScalar::Date(d) => Datum::Date(d),
+            AvroScalar::Timestamp(t) => Datum::Timestamp(t),
         }
     }
 }
