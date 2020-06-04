@@ -7,26 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::convert::From;
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use failure::{bail, format_err};
+use failure::format_err;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
-use self::datetime::DateTimeField;
-use self::decimal::Significand;
+use crate::adt::decimal::Significand;
+use crate::adt::interval::Interval;
 use crate::{ColumnType, DatumDict, DatumList};
-
-use avro::types::Scalar as AvroScalar;
-
-pub mod datetime;
-pub mod decimal;
-pub mod jsonb;
-pub mod regex;
-pub mod strconv;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum OwnedDatum {
@@ -48,7 +39,8 @@ impl<'a> From<&'a OwnedDatum> for Datum<'a> {
         }
     }
 }
-/// A literal value.
+
+/// A single value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Datum<'a> {
     /// An unknown value.
@@ -65,17 +57,15 @@ pub enum Datum<'a> {
     Float32(OrderedFloat<f32>),
     /// A 64-bit floating point number.
     Float64(OrderedFloat<f64>),
-    /// A Date
+    /// A date.
     Date(NaiveDate),
-    /// A Time without a Date
+    /// A time.
     Time(NaiveTime),
-    /// A DateTime
+    /// A date and time, without a timezone.
     Timestamp(NaiveDateTime),
-    /// A time zone aware DateTime
+    /// A date and time, with a timezone.
     TimestampTz(DateTime<Utc>),
-    /// A span of time
-    ///
-    /// Either a concrete number of seconds, or an abstract number of Months
+    /// A span of time.
     Interval(Interval),
     /// An exact decimal number, possibly with a fractional component, with up
     /// to 38 digits of precision.
@@ -84,11 +74,14 @@ pub enum Datum<'a> {
     Bytes(&'a [u8]),
     /// A sequence of Unicode codepoints encoded as UTF-8.
     String(&'a str),
-    /// A heterogenous sequence of Datums
+    /// A homogeneous sequence of `Datum`s.
     List(DatumList<'a>),
-    /// A mapping from string keys to Datums,
+    /// A mapping from string keys to `Datum`s.
     Dict(DatumDict<'a>),
-    /// Json null does not behave like SQL null :'(
+    /// An unknown value within a JSON-typed `Datum`.
+    ///
+    /// This variant is distinct from [`Datum::Null`] as a null datum is
+    /// distinct from a non-null datum that contains the JSON value `null`.
     JsonNull,
 }
 
@@ -115,12 +108,15 @@ impl<'a> Datum<'a> {
                     Datum::Interval(x) => Datum::Interval(x),
                     Datum::Decimal(x) => Datum::Decimal(x),
                     Datum::JsonNull => Datum::JsonNull,
-                    _ => unreachable!(),
+                    Datum::Bytes(_) | Datum::String(_) | Datum::List(_) | Datum::Dict(_) => {
+                        unreachable!()
+                    }
                 };
                 OwnedDatum::Datum(d)
             }
         }
     }
+    /// Reports whether this datum is null (i.e., is [`Datum::Null`]).
     pub fn is_null(&self) -> bool {
         match self {
             Datum::Null => true,
@@ -215,6 +211,11 @@ impl<'a> Datum<'a> {
         )))
     }
 
+    /// Unwraps the boolean value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::False`] or [`Datum::True`].
     pub fn unwrap_bool(&self) -> bool {
         match self {
             Datum::False => false,
@@ -223,6 +224,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the 32-bit integer value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Int32`].
     pub fn unwrap_int32(&self) -> i32 {
         match self {
             Datum::Int32(i) => *i,
@@ -230,6 +236,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the 64-bit integer value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Int64`].
     pub fn unwrap_int64(&self) -> i64 {
         match self {
             Datum::Int64(i) => *i,
@@ -251,6 +262,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the 32-bit floating-point value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Float32`].
     pub fn unwrap_float32(&self) -> f32 {
         match self {
             Datum::Float32(f) => f.into_inner(),
@@ -258,6 +274,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the 64-bit floating-point value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Float64`].
     pub fn unwrap_float64(&self) -> f64 {
         match self {
             Datum::Float64(f) => f.into_inner(),
@@ -265,6 +286,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the date value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Date`].
     pub fn unwrap_date(&self) -> chrono::NaiveDate {
         match self {
             Datum::Date(d) => *d,
@@ -272,6 +298,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the time value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Time`].
     pub fn unwrap_time(&self) -> chrono::NaiveTime {
         match self {
             Datum::Time(t) => *t,
@@ -279,6 +310,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the timestamp value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Timestamp`].
     pub fn unwrap_timestamp(&self) -> chrono::NaiveDateTime {
         match self {
             Datum::Timestamp(ts) => *ts,
@@ -286,6 +322,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the timestamptz value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::TimestampTz`].
     pub fn unwrap_timestamptz(&self) -> chrono::DateTime<Utc> {
         match self {
             Datum::TimestampTz(ts) => *ts,
@@ -293,6 +334,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the interval value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Interval`].
     pub fn unwrap_interval(&self) -> Interval {
         match self {
             Datum::Interval(iv) => *iv,
@@ -300,6 +346,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the decimal value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Decimal`].
     pub fn unwrap_decimal(&self) -> Significand {
         match self {
             Datum::Decimal(d) => *d,
@@ -307,6 +358,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the string value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::String`].
     pub fn unwrap_str(&self) -> &'a str {
         match self {
             Datum::String(s) => s,
@@ -314,6 +370,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the bytes value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Bytes`].
     pub fn unwrap_bytes(&self) -> &'a [u8] {
         match self {
             Datum::Bytes(b) => b,
@@ -321,6 +382,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the list value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::List`].
     pub fn unwrap_list(&self) -> DatumList<'a> {
         match self {
             Datum::List(list) => *list,
@@ -328,6 +394,11 @@ impl<'a> Datum<'a> {
         }
     }
 
+    /// Unwraps the dict value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Dict`].
     pub fn unwrap_dict(&self) -> DatumDict<'a> {
         match self {
             Datum::Dict(dict) => *dict,
@@ -339,6 +410,7 @@ impl<'a> Datum<'a> {
         Datum::TimestampTz(DateTime::<Utc>::from_utc(ndt, Utc))
     }
 
+    /// Reports whether this datum is an instance of the specified column type.
     pub fn is_instance_of(self, column_type: &ColumnType) -> bool {
         fn is_instance_of_scalar(datum: Datum, scalar_type: &ScalarType) -> bool {
             if let ScalarType::Jsonb = scalar_type {
@@ -360,7 +432,6 @@ impl<'a> Datum<'a> {
             } else {
                 // sql type checking
                 match (datum, scalar_type) {
-                    (Datum::Null, ScalarType::Unknown) => true,
                     (Datum::Null, _) => false,
                     (Datum::False, ScalarType::Bool) => true,
                     (Datum::False, _) => false,
@@ -468,15 +539,14 @@ impl From<Significand> for Datum<'static> {
 
 impl From<chrono::Duration> for Datum<'static> {
     fn from(duration: chrono::Duration) -> Datum<'static> {
-        let n_secs = duration.num_seconds();
-        Datum::Interval(Interval {
-            months: 0,
-            is_positive_dur: n_secs >= 0,
-            duration: std::time::Duration::new(
-                n_secs.abs() as u64,
-                (duration.num_nanoseconds().unwrap_or(0) % 1_000_000_000) as u32,
-            ),
-        })
+        Datum::Interval(
+            Interval::new(
+                0,
+                duration.num_seconds(),
+                duration.num_nanoseconds().unwrap_or(0) % 1_000_000_000,
+            )
+            .unwrap(),
+        )
     }
 }
 
@@ -525,22 +595,6 @@ where
             d.into()
         } else {
             Datum::Null
-        }
-    }
-}
-
-impl<'a> From<AvroScalar> for Datum<'a> {
-    fn from(s: AvroScalar) -> Datum<'a> {
-        match s {
-            AvroScalar::Null => Datum::Null,
-            AvroScalar::Boolean(true) => Datum::True,
-            AvroScalar::Boolean(false) => Datum::False,
-            AvroScalar::Int(i) => Datum::Int32(i),
-            AvroScalar::Long(l) => Datum::Int64(l),
-            AvroScalar::Float(f) => Datum::Float32(OrderedFloat(f)),
-            AvroScalar::Double(d) => Datum::Float64(OrderedFloat(d)),
-            AvroScalar::Date(d) => Datum::Date(d),
-            AvroScalar::Timestamp(ts) => Datum::Timestamp(ts),
         }
     }
 }
@@ -614,52 +668,71 @@ impl fmt::Display for Datum<'_> {
     }
 }
 
-/// The fundamental type of a [`Datum`].
+/// The type of a [`Datum`].
 ///
-/// A fundamental type is what is typically thought of as a type, like "Int32"
-/// or "String." The full [`ColumnType`] struct bundles additional information, like
-/// an optional default value and nullability, that must also be considered part
-/// of a datum's type.
+/// There is a direct correspondence between `Datum` variants and `ScalarType`
+/// variants.
 #[derive(Clone, Debug, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub enum ScalarType {
-    /// The type of an unknown datum. Whenever possible, this variant should be
-    /// avoided, as clients are typically unable to handle it.
-    ///
-    /// The usual situation in which this variant arises is in a SQL query like
-    /// `SELECT NULL`, where there is no additional hint about what type `NULL`
-    /// should take on.
-    Unknown,
+    /// The type of [`Datum::True`] and [`Datum::False`].
     Bool,
+    /// The type of [`Datum::Int32`].
     Int32,
+    /// The type of [`Datum::Int64`].
     Int64,
+    /// The type of [`Datum::Float32`].
     Float32,
+    /// The type of [`Datum::Float64`].
     Float64,
-    /// An exact decimal number with a specified precision and scale. The
-    /// precision constrains the total number of digits in the number, while the
-    /// scale specifies the number of digits after the decimal point. The
-    /// maximum precision is [`decimal::MAX_DECIMAL_PRECISION`]. The scale must
-    /// be less than or equal to the precision.
-    Decimal(u8, u8),
-    Date,
-    Time,
-    Timestamp,
-    TimestampTz,
-    /// A possibly-negative time span
+    /// The type of [`Datum::Decimal`].
     ///
-    /// Represented by the [`Interval`] enum
+    /// This type additionally specifies the precision and scale of the decimal
+    /// . The precision constrains the total number of digits in the number,
+    /// while the scale specifies the number of digits after the decimal point.
+    /// The maximum precision is [`MAX_DECIMAL_PRECISION`]. The scale
+    /// must be less than or equal to the precision.
+    ///
+    /// [`MAX_DECIMAL_PRECISION`]: crate::adt::decimal::MAX_DECIMAL_PRECISION
+    Decimal(u8, u8),
+    /// The type of [`Datum::Date`].
+    Date,
+    /// The type of [`Datum::Time`].
+    Time,
+    /// The type of [`Datum::Timestamp`].
+    Timestamp,
+    /// The type of [`Datum::TimestampTz`].
+    TimestampTz,
+    /// The type of [`Datum::Interval`].
     Interval,
+    /// The type of [`Datum::Bytes`].
     Bytes,
+    /// The type of [`Datum::String`].
     String,
-    /// Json behaves like postgres' jsonb type but is stored as Datum::JsonNull/True/False/String/Float64/List/Dict.
-    /// The sql type system is responsible for preventing these being used as normal sql datums without casting.
+    /// The type of a datum that may represent any valid JSON value.
+    ///
+    /// Valid datum variants for this type are:
+    ///
+    ///   * [`Datum::Null`]
+    ///   * [`Datum::False`]
+    ///   * [`Datum::True`]
+    ///   * [`Datum::String`]
+    ///   * [`Datum::Float64`]
+    ///   * [`Datum::List`]
+    ///   * [`Datum::Dict`]
     Jsonb,
-    /// A sensible array type (named List to leave the door open for supporting the postgres array type as Array)
-    /// Backed by a DatumList
-    /// Due to limits of sql type syntax, List elements are always allowed to be null
+    /// The type of [`Datum::List`].
+    ///
+    /// Elements within the list are of the specified type. List elements may
+    /// always be [`Datum::Null`].
     List(Box<ScalarType>),
 }
 
 impl<'a> ScalarType {
+    /// Returns the contained decimal precision and scale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the scalar type is not [`ScalarType::Decimal`].
     pub fn unwrap_decimal_parts(&self) -> (u8, u8) {
         match self {
             ScalarType::Decimal(p, s) => (*p, *s),
@@ -667,9 +740,9 @@ impl<'a> ScalarType {
         }
     }
 
+    /// Constructs a dummy datum for this type.
     pub fn dummy_datum(&self) -> Datum<'a> {
         match self {
-            ScalarType::Unknown => Datum::Null,
             ScalarType::Bool => Datum::False,
             ScalarType::Int32 => Datum::Int32(0),
             ScalarType::Int64 => Datum::Int64(0),
@@ -700,8 +773,7 @@ impl PartialEq for ScalarType {
         match (self, other) {
             (Decimal(_, s1), Decimal(_, s2)) => s1 == s2,
 
-            (Unknown, Unknown)
-            | (Bool, Bool)
+            (Bool, Bool)
             | (Int32, Int32)
             | (Int64, Int64)
             | (Float32, Float32)
@@ -717,8 +789,7 @@ impl PartialEq for ScalarType {
 
             (List(a), List(b)) => a.eq(b),
 
-            (Unknown, _)
-            | (Bool, _)
+            (Bool, _)
             | (Int32, _)
             | (Int64, _)
             | (Float32, _)
@@ -741,28 +812,27 @@ impl Hash for ScalarType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         use ScalarType::*;
         match self {
-            Unknown => state.write_u8(0),
-            Bool => state.write_u8(1),
-            Int32 => state.write_u8(2),
-            Int64 => state.write_u8(3),
-            Float32 => state.write_u8(4),
-            Float64 => state.write_u8(5),
+            Bool => state.write_u8(0),
+            Int32 => state.write_u8(1),
+            Int64 => state.write_u8(2),
+            Float32 => state.write_u8(3),
+            Float64 => state.write_u8(4),
             Decimal(_, s) => {
                 // TODO(benesch): we should properly implement decimal precision
                 // tracking, or just remove it.
-                state.write_u8(6);
+                state.write_u8(5);
                 state.write_u8(*s);
             }
-            Date => state.write_u8(7),
-            Time => state.write_u8(8),
-            Timestamp => state.write_u8(9),
-            TimestampTz => state.write_u8(10),
-            Interval => state.write_u8(11),
-            Bytes => state.write_u8(12),
-            String => state.write_u8(13),
-            Jsonb => state.write_u8(14),
+            Date => state.write_u8(6),
+            Time => state.write_u8(7),
+            Timestamp => state.write_u8(8),
+            TimestampTz => state.write_u8(9),
+            Interval => state.write_u8(10),
+            Bytes => state.write_u8(11),
+            String => state.write_u8(12),
+            Jsonb => state.write_u8(13),
             List(t) => {
-                state.write_u8(15);
+                state.write_u8(14);
                 t.hash(state);
             }
         }
@@ -778,7 +848,6 @@ impl fmt::Display for ScalarType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use ScalarType::*;
         match self {
-            Unknown => f.write_str("null"),
             Bool => f.write_str("bool"),
             Int32 => f.write_str("i32"),
             Int64 => f.write_str("i64"),
@@ -794,613 +863,6 @@ impl fmt::Display for ScalarType {
             String => f.write_str("string"),
             Jsonb => f.write_str("jsonb"),
             List(t) => write!(f, "{}[]", t),
-        }
-    }
-}
-
-impl fmt::Display for ColumnType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "{}{}",
-            self.scalar_type,
-            if self.nullable { "?" } else { "" }
-        )
-    }
-}
-
-/// An interval of time meant to express SQL intervals.
-///
-/// Obtained by parsing an `INTERVAL '<value>' <unit> [TO <precision>]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Hash, Deserialize)]
-pub struct Interval {
-    /// A possibly negative number of months for field types like `YEAR`
-    pub months: i64,
-    /// An actual timespan, possibly negative, because why not
-    pub duration: std::time::Duration,
-    pub is_positive_dur: bool,
-}
-
-impl Default for Interval {
-    fn default() -> Self {
-        Self {
-            months: 0,
-            duration: std::time::Duration::default(),
-            is_positive_dur: true,
-        }
-    }
-}
-
-impl std::ops::Add for Interval {
-    type Output = Self;
-    // Since durations can only be positive, we need subtraction and boolean
-    // operators inside the Add impl
-    #[allow(clippy::suspicious_arithmetic_impl)]
-    fn add(self, other: Self) -> Self {
-        let (is_positive_dur, duration) = if self.is_positive_dur == other.is_positive_dur {
-            (self.is_positive_dur, self.duration + other.duration)
-        } else if self.duration > other.duration {
-            (self.is_positive_dur, self.duration - other.duration)
-        } else {
-            (other.is_positive_dur, other.duration - self.duration)
-        };
-
-        Self {
-            months: self.months + other.months,
-            duration,
-            is_positive_dur,
-        }
-    }
-}
-
-impl std::ops::Sub for Interval {
-    type Output = Self;
-    fn sub(self, other: Self) -> Self {
-        self + -other
-    }
-}
-
-impl std::ops::Neg for Interval {
-    type Output = Self;
-    fn neg(self) -> Self {
-        Self {
-            months: -self.months,
-            duration: self.duration,
-            is_positive_dur: !self.is_positive_dur,
-        }
-    }
-}
-
-impl Interval {
-    /// Computes the year part of the interval.
-    ///
-    /// The year part is the number of whole years in the interval. For example,
-    /// this function returns `3.0` for the interval `3 years 4 months`.
-    pub fn years(&self) -> f64 {
-        (self.months / 12) as f64
-    }
-
-    /// Computes the month part of the interval.
-    ///
-    /// The whole part is the number of whole months in the interval, modulo 12.
-    /// For example, this function returns `4.0` for the interval `3 years 4
-    /// months`.
-    pub fn months(&self) -> f64 {
-        (self.months % 12) as f64
-    }
-
-    /// Computes the day part of the interval.
-    ///
-    /// The day part is the number of whole days in the interval. For example,
-    /// this function returns `5.0` for the interval `5 days 4 hours 3 minutes
-    /// 2.1 seconds`.
-    pub fn days(&self) -> f64 {
-        (self.duration.as_secs() / (60 * 60 * 24)) as f64
-    }
-
-    /// Computes the hour part of the interval.
-    ///
-    /// The hour part is the number of whole hours in the interval, modulo 24.
-    /// For example, this function returns `4.0` for the interval `5 days 4
-    /// hours 3 minutes 2.1 seconds`.
-    pub fn hours(&self) -> f64 {
-        ((self.duration.as_secs() / (60 * 60)) % 24) as f64
-    }
-
-    /// Computes the minute part of the interval.
-    ///
-    /// The minute part is the number of whole minutes in the interval, modulo
-    /// 60. For example, this function returns `3.0` for the interval `5 days 4
-    /// hours 3 minutes 2.1 seconds`.
-    pub fn minutes(&self) -> f64 {
-        ((self.duration.as_secs() / 60) % 60) as f64
-    }
-
-    /// Computes the second part of the interval.
-    ///
-    /// The second part is the number of fractional seconds in the interval,
-    /// modulo 60.0.
-    pub fn seconds(&self) -> f64 {
-        let s = (self.duration.as_secs() % 60) as f64;
-        let ns = f64::from(self.duration.subsec_nanos()) / 1e9;
-        s + ns
-    }
-
-    /// Computes the nanosecond part of the interval.
-    pub fn nanoseconds(&self) -> i64 {
-        if self.is_positive_dur {
-            self.duration.subsec_nanos() as i64
-        } else {
-            -(self.duration.subsec_nanos() as i64)
-        }
-    }
-
-    /// Computes the total number of seconds in the interval.
-    pub fn as_seconds(&self) -> f64 {
-        (self.months as f64) * 60.0 * 60.0 * 24.0 * 30.0
-            + (self.duration.as_secs() as f64)
-            + f64::from(self.duration.subsec_micros()) / 1e6
-    }
-
-    /// Truncate the "head" of the interval, removing all time units greater than `f`.
-    pub fn truncate_high_fields(&mut self, f: DateTimeField) {
-        use std::time::Duration;
-        match f {
-            DateTimeField::Year => {}
-            DateTimeField::Month => self.months %= 12,
-            DateTimeField::Day => self.months = 0,
-            hms => {
-                self.months = 0;
-                self.duration = Duration::new(
-                    self.duration.as_secs() % seconds_multiplier(hms.next_largest()),
-                    self.duration.subsec_nanos(),
-                );
-            }
-        }
-    }
-
-    /// Truncate the "tail" of the interval, removing all time units less than `f`.
-    /// # Arguments
-    /// - `f`: Round the interval down to the specified time unit.
-    /// - `fsec_max_precision`: If `Some(x)`, keep only `x` places of nanosecond precision.
-    ///    Must be `(0,6)`.
-    ///
-    /// # Errors
-    /// - If `fsec_max_precision` is not None or within (0,6).
-    pub fn truncate_low_fields(
-        &mut self,
-        f: DateTimeField,
-        fsec_max_precision: Option<u64>,
-    ) -> Result<(), failure::Error> {
-        use std::time::Duration;
-        use DateTimeField::*;
-        match f {
-            Year => {
-                self.months -= self.months % 12;
-                self.duration = Duration::new(0, 0);
-            }
-            Month => {
-                self.duration = Duration::new(0, 0);
-            }
-            // Round nanoseconds.
-            Second => {
-                let default_precision = 6;
-                let precision = match fsec_max_precision {
-                    Some(p) => p,
-                    None => default_precision,
-                };
-
-                if precision > default_precision {
-                    bail!(
-                        "SECOND precision must be (0, 6), have SECOND({})",
-                        precision
-                    )
-                }
-
-                let mut nanos = self.duration.subsec_nanos();
-
-                // Check if value should round up to nearest fractional place.
-                let remainder = nanos % 10_u32.pow(9 - precision as u32);
-                if remainder / 10_u32.pow(8 - precision as u32) > 4 {
-                    nanos += 10_u32.pow(9 - precision as u32);
-                }
-
-                self.duration = Duration::new(self.duration.as_secs(), nanos - remainder);
-            }
-            dhm => {
-                self.duration = Duration::new(
-                    self.duration.as_secs() - self.duration.as_secs() % (seconds_multiplier(dhm)),
-                    0,
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Returns the number of seconds in a single unit of `field`.
-fn seconds_multiplier(field: DateTimeField) -> u64 {
-    use DateTimeField::*;
-    match field {
-        Day => 60 * 60 * 24,
-        Hour => 60 * 60,
-        Minute => 60,
-        Second => 1,
-        _other => unreachable!("Do not call with a non-duration field"),
-    }
-}
-
-/// Format an interval in a human form
-///
-/// Example outputs:
-///
-/// * 1 year 2 months 5 days 03:04:00
-/// * -1 year +5 days +18:59:29.3
-/// * 00:00:00
-impl fmt::Display for Interval {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut months = self.months;
-        let neg_mos = months < 0;
-        months = months.abs();
-        let years = months / 12;
-        months %= 12;
-        let mut secs = self.duration.as_secs();
-        let mut nanos = self.duration.subsec_nanos();
-        let days = secs / (24 * 60 * 60);
-        secs %= 24 * 60 * 60;
-        let hours = secs / (60 * 60);
-        secs %= 60 * 60;
-        let minutes = secs / 60;
-        secs %= 60;
-
-        if years > 0 {
-            if neg_mos {
-                f.write_char('-')?;
-            }
-            write!(f, "{} year", years)?;
-            if years > 1 {
-                f.write_char('s')?;
-            }
-        }
-
-        if months > 0 {
-            if years != 0 {
-                f.write_char(' ')?;
-            }
-            if neg_mos {
-                f.write_char('-')?;
-            }
-            write!(f, "{} month", months)?;
-            if months > 1 {
-                f.write_char('s')?;
-            }
-        }
-
-        if days > 0 {
-            if years > 0 || months > 0 {
-                f.write_char(' ')?;
-            }
-            if !self.is_positive_dur {
-                f.write_char('-')?;
-            } else if neg_mos {
-                f.write_char('+')?;
-            }
-            write!(f, "{} day", days)?;
-            if days != 1 {
-                f.write_char('s')?;
-            }
-        }
-
-        let non_zero_hmsn = hours > 0 || minutes > 0 || secs > 0 || nanos > 0;
-
-        if (years == 0 && months == 0 && days == 0) || non_zero_hmsn {
-            if years > 0 || months > 0 || days > 0 {
-                f.write_char(' ')?;
-            }
-            if !self.is_positive_dur && non_zero_hmsn {
-                f.write_char('-')?;
-            } else if neg_mos {
-                f.write_char('+')?;
-            }
-            write!(f, "{:02}:{:02}:{:02}", hours, minutes, secs)?;
-            if nanos > 0 {
-                let mut width = 9;
-                while nanos % 10 == 0 {
-                    width -= 1;
-                    nanos /= 10;
-                }
-                write!(f, ".{:0width$}", nanos, width = width)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn interval_fmt() {
-        fn mon(mon: i64) -> String {
-            Interval {
-                months: mon,
-                ..Default::default()
-            }
-            .to_string()
-        }
-
-        assert_eq!(mon(1), "1 month");
-        assert_eq!(mon(12), "1 year");
-        assert_eq!(mon(13), "1 year 1 month");
-        assert_eq!(mon(24), "2 years");
-        assert_eq!(mon(25), "2 years 1 month");
-        assert_eq!(mon(26), "2 years 2 months");
-
-        fn dur(is_positive_dur: bool, d: u64) -> String {
-            Interval {
-                months: 0,
-                duration: std::time::Duration::from_secs(d),
-                is_positive_dur,
-            }
-            .to_string()
-        }
-        assert_eq!(&dur(true, 86_400 * 2), "2 days");
-        assert_eq!(&dur(true, 86_400 * 2 + 3_600 * 3), "2 days 03:00:00");
-        assert_eq!(
-            &dur(true, 86_400 * 2 + 3_600 * 3 + 60 * 45 + 6),
-            "2 days 03:45:06"
-        );
-        assert_eq!(
-            &dur(true, 86_400 * 2 + 3_600 * 3 + 60 * 45),
-            "2 days 03:45:00"
-        );
-        assert_eq!(&dur(true, 86_400 * 2 + 6), "2 days 00:00:06");
-        assert_eq!(&dur(true, 86_400 * 2 + 60 * 45 + 6), "2 days 00:45:06");
-        assert_eq!(&dur(true, 86_400 * 2 + 3_600 * 3 + 6), "2 days 03:00:06");
-        assert_eq!(&dur(true, 3_600 * 3 + 60 * 45 + 6), "03:45:06");
-        assert_eq!(&dur(true, 3_600 * 3 + 6), "03:00:06");
-        assert_eq!(&dur(true, 3_600 * 3), "03:00:00");
-        assert_eq!(&dur(true, 60 * 45 + 6), "00:45:06");
-        assert_eq!(&dur(true, 60 * 45), "00:45:00");
-        assert_eq!(&dur(true, 6), "00:00:06");
-
-        assert_eq!(&dur(false, 86_400 * 2 + 6), "-2 days -00:00:06");
-        assert_eq!(&dur(false, 86_400 * 2 + 60 * 45 + 6), "-2 days -00:45:06");
-        assert_eq!(&dur(false, 86_400 * 2 + 3_600 * 3 + 6), "-2 days -03:00:06");
-        assert_eq!(&dur(false, 3_600 * 3 + 60 * 45 + 6), "-03:45:06");
-        assert_eq!(&dur(false, 3_600 * 3 + 6), "-03:00:06");
-        assert_eq!(&dur(false, 3_600 * 3), "-03:00:00");
-        assert_eq!(&dur(false, 60 * 45 + 6), "-00:45:06");
-        assert_eq!(&dur(false, 60 * 45), "-00:45:00");
-        assert_eq!(&dur(false, 6), "-00:00:06");
-
-        fn mon_dur(mon: i64, is_positive_dur: bool, d: u64) -> String {
-            Interval {
-                months: mon,
-                duration: std::time::Duration::from_secs(d),
-                is_positive_dur,
-            }
-            .to_string()
-        }
-        assert_eq!(&mon_dur(1, true, 86_400 * 2 + 6), "1 month 2 days 00:00:06");
-        assert_eq!(
-            &mon_dur(1, true, 86_400 * 2 + 60 * 45 + 6),
-            "1 month 2 days 00:45:06"
-        );
-        assert_eq!(
-            &mon_dur(1, true, 86_400 * 2 + 3_600 * 3 + 6),
-            "1 month 2 days 03:00:06"
-        );
-        assert_eq!(
-            &mon_dur(26, true, 3_600 * 3 + 60 * 45 + 6),
-            "2 years 2 months 03:45:06"
-        );
-        assert_eq!(
-            &mon_dur(26, true, 3_600 * 3 + 6),
-            "2 years 2 months 03:00:06"
-        );
-        assert_eq!(&mon_dur(26, true, 3_600 * 3), "2 years 2 months 03:00:00");
-        assert_eq!(&mon_dur(26, true, 60 * 45 + 6), "2 years 2 months 00:45:06");
-        assert_eq!(&mon_dur(26, true, 60 * 45), "2 years 2 months 00:45:00");
-        assert_eq!(&mon_dur(26, true, 6), "2 years 2 months 00:00:06");
-
-        assert_eq!(
-            &mon_dur(26, false, 86_400 * 2 + 6),
-            "2 years 2 months -2 days -00:00:06"
-        );
-        assert_eq!(
-            &mon_dur(26, false, 86_400 * 2 + 60 * 45 + 6),
-            "2 years 2 months -2 days -00:45:06"
-        );
-        assert_eq!(
-            &mon_dur(26, false, 86_400 * 2 + 3_600 * 3 + 6),
-            "2 years 2 months -2 days -03:00:06"
-        );
-        assert_eq!(
-            &mon_dur(26, false, 3_600 * 3 + 60 * 45 + 6),
-            "2 years 2 months -03:45:06"
-        );
-        assert_eq!(
-            &mon_dur(26, false, 3_600 * 3 + 6),
-            "2 years 2 months -03:00:06"
-        );
-        assert_eq!(&mon_dur(26, false, 3_600 * 3), "2 years 2 months -03:00:00");
-        assert_eq!(
-            &mon_dur(26, false, 60 * 45 + 6),
-            "2 years 2 months -00:45:06"
-        );
-        assert_eq!(&mon_dur(26, false, 60 * 45), "2 years 2 months -00:45:00");
-        assert_eq!(&mon_dur(26, false, 6), "2 years 2 months -00:00:06");
-
-        assert_eq!(
-            &mon_dur(-1, true, 86_400 * 2 + 6),
-            "-1 month +2 days +00:00:06"
-        );
-        assert_eq!(
-            &mon_dur(-1, true, 86_400 * 2 + 60 * 45 + 6),
-            "-1 month +2 days +00:45:06"
-        );
-        assert_eq!(
-            &mon_dur(-1, true, 86_400 * 2 + 3_600 * 3 + 6),
-            "-1 month +2 days +03:00:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, true, 3_600 * 3 + 60 * 45 + 6),
-            "-2 years -2 months +03:45:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, true, 3_600 * 3 + 6),
-            "-2 years -2 months +03:00:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, true, 3_600 * 3),
-            "-2 years -2 months +03:00:00"
-        );
-        assert_eq!(
-            &mon_dur(-26, true, 60 * 45 + 6),
-            "-2 years -2 months +00:45:06"
-        );
-        assert_eq!(&mon_dur(-26, true, 60 * 45), "-2 years -2 months +00:45:00");
-        assert_eq!(&mon_dur(-26, true, 6), "-2 years -2 months +00:00:06");
-
-        assert_eq!(
-            &mon_dur(-26, false, 86_400 * 2 + 6),
-            "-2 years -2 months -2 days -00:00:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, false, 86_400 * 2 + 60 * 45 + 6),
-            "-2 years -2 months -2 days -00:45:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, false, 86_400 * 2 + 3_600 * 3 + 6),
-            "-2 years -2 months -2 days -03:00:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, false, 3_600 * 3 + 60 * 45 + 6),
-            "-2 years -2 months -03:45:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, false, 3_600 * 3 + 6),
-            "-2 years -2 months -03:00:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, false, 3_600 * 3),
-            "-2 years -2 months -03:00:00"
-        );
-        assert_eq!(
-            &mon_dur(-26, false, 60 * 45 + 6),
-            "-2 years -2 months -00:45:06"
-        );
-        assert_eq!(
-            &mon_dur(-26, false, 60 * 45),
-            "-2 years -2 months -00:45:00"
-        );
-        assert_eq!(&mon_dur(-26, false, 6), "-2 years -2 months -00:00:06");
-    }
-
-    #[test]
-    fn test_interval_value_truncate_low_fields() {
-        use DateTimeField::*;
-
-        let mut test_cases = [
-            (Year, None, (321, 654_321, 321_000_000), (26 * 12, 0, 0)),
-            (Month, None, (321, 654_321, 321_000_000), (321, 0, 0)),
-            (
-                Day,
-                None,
-                (321, 654_321, 321_000_000),
-                (321, 7 * 60 * 60 * 24, 0), // months: 321, duration: 604800s, is_positive_dur: true
-            ),
-            (
-                Hour,
-                None,
-                (321, 654_321, 321_000_000),
-                (321, 181 * 60 * 60, 0),
-            ),
-            (
-                Minute,
-                None,
-                (321, 654_321, 321_000_000),
-                (321, 10905 * 60, 0),
-            ),
-            (
-                Second,
-                None,
-                (321, 654_321, 321_000_000),
-                (321, 654_321, 321_000_000),
-            ),
-            (
-                Second,
-                Some(1),
-                (321, 654_321, 321_000_000),
-                (321, 654_321, 300_000_000),
-            ),
-            (
-                Second,
-                Some(0),
-                (321, 654_321, 321_000_000),
-                (321, 654_321, 0),
-            ),
-        ];
-
-        for test in test_cases.iter_mut() {
-            let mut i = Interval {
-                months: (test.2).0,
-                duration: std::time::Duration::new((test.2).1, (test.2).2),
-                is_positive_dur: true,
-            };
-            let j = Interval {
-                months: (test.3).0,
-                duration: std::time::Duration::new((test.3).1, (test.3).2),
-                is_positive_dur: true,
-            };
-
-            i.truncate_low_fields(test.0, test.1).unwrap();
-
-            if i != j {
-                panic!(
-                "test_interval_value_truncate_low_fields failed on {} \n actual: {:?} \n expected: {:?}",
-                test.0, i, j
-            );
-            }
-        }
-    }
-
-    #[test]
-    fn test_interval_value_truncate_high_fields() {
-        use DateTimeField::*;
-
-        let mut test_cases = [
-            (Year, (321, 654_321), (321, 654_321)),
-            (Month, (321, 654_321), (9, 654_321)),
-            (Day, (321, 654_321), (0, 654_321)),
-            (Hour, (321, 654_321), (0, 654_321 % (60 * 60 * 24))),
-            (Minute, (321, 654_321), (0, 654_321 % (60 * 60))),
-            (Second, (321, 654_321), (0, 654_321 % 60)),
-        ];
-
-        for test in test_cases.iter_mut() {
-            let mut i = Interval {
-                months: (test.1).0,
-                duration: std::time::Duration::new((test.1).1 as u64, 123),
-                is_positive_dur: true,
-            };
-            let j = Interval {
-                months: (test.2).0,
-                duration: std::time::Duration::new((test.2).1 as u64, 123),
-                is_positive_dur: true,
-            };
-
-            i.truncate_high_fields(test.0);
-
-            if i != j {
-                panic!(
-                "test_interval_value_truncate_high_fields failed on {} \n actual: {:?} \n expected: {:?}",
-                test.0, i, j
-            );
-            }
         }
     }
 }
