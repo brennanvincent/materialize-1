@@ -48,7 +48,7 @@ fn main() {
 }
 
 fn run() -> Result<(), failure::Error> {
-    panic::set_hook(Box::new(handle_panic));
+    //    panic::set_hook(Box::new(handle_panic));
 
     let args: Vec<_> = env::args().collect();
     let mut opts = getopts::Options::new();

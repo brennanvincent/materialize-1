@@ -33,7 +33,10 @@ use avro::{
 
 use repr::adt::decimal::{Significand, MAX_DECIMAL_PRECISION};
 use repr::adt::jsonb::{Jsonb, JsonbPacker, JsonbRef};
-use repr::{ColumnType, Datum, OwnedDatum, RelationDesc, RelationType, Row, RowPacker, ScalarType};
+use repr::{
+    ColumnType, Datum, DatumList, OwnedDatum, RelationDesc, RelationType, Row, RowPacker,
+    ScalarType,
+};
 
 use crate::error::Result;
 
@@ -453,7 +456,6 @@ enum DebeziumDecodeState2 {
     Start,
     InRootRecord,
     AtEnvelopeField,
-    InEnvelopeRecord,
     AtBeforeField,
     InBeforeRecord,
     AtBeforeSubfield(usize),
@@ -504,7 +506,7 @@ impl RowState {
             stash: vec![],
         }
     }
-    fn finish(&mut self) -> Row {
+    fn finish<'a, I: IntoIterator<Item = Datum<'a>>>(&mut self, extra: I) -> Row {
         let buf = self.buf.as_mut().unwrap();
         self.stash.sort_unstable_by_key(|(idx, _)| *idx);
         for (idx, item) in self.stash.drain(..) {
@@ -516,6 +518,9 @@ impl RowState {
             }
         }
         self.next = 0;
+        for datum in extra {
+            buf.push(datum);
+        }
         buf.finish_and_reuse()
     }
 
@@ -543,12 +548,12 @@ struct DebeziumAvroDecoder {
 impl DebeziumAvroDecoder {
     fn finish(&mut self) -> DiffPair<Row> {
         let before = if self.before_present {
-            Some(self.before_state.finish())
+            Some(self.before_state.finish(Some(Datum::Int64(-1))))
         } else {
             None
         };
         let after = if self.after_present {
-            Some(self.after_state.finish())
+            Some(self.after_state.finish(Some(Datum::Int64(1))))
         } else {
             None
         };
@@ -584,28 +589,30 @@ impl DebeziumAvroDecoder {
 // want to call it while the datum is borrowing from self.
 macro_rules! give_datum {
     ($self:ident, $datum:expr) => {
-        let datum: Datum = $datum;
-        let (row_state, datum_idx) = match $self.state {
-            DebeziumDecodeState2::AtBeforeSubfield(idx) => (&mut $self.before_state, idx),
-            DebeziumDecodeState2::AtAfterSubfield(idx) => (&mut $self.after_state, idx),
-            _ => todo!(),
-        };
-        if row_state.next == datum_idx {
-            // The happy, in-order case - just write directly into the row. No need to stash anything anywhere.
-            row_state.buf.as_mut().unwrap().extend(Some(datum));
-            row_state.next += 1;
-        } else {
-            // This is the case when fields are in a different order in the reader schema from
-            // the writer schema.
-            //
-            // TODO - do something smart to avoid the allocations/clones here if people complain. It won't matter much
-            // for scalar columns. Maybe for non-scalars (e.g. string) we can create one allocation per column and reuse it.
-            row_state.stash.push((datum_idx, StashItem::OwnedDatum(datum.to_owned())));
-        }
-        $self.state = match $self.state {
-            DebeziumDecodeState2::AtBeforeSubfield(_) => DebeziumDecodeState2::InBeforeRecord,
-            DebeziumDecodeState2::AtAfterSubfield(_) => DebeziumDecodeState2::InAfterRecord,
-            _ => unreachable!()
+        {
+            let datum: Datum = $datum;
+            let (row_state, datum_idx) = match $self.state {
+                DebeziumDecodeState2::AtBeforeSubfield(idx) => (&mut $self.before_state, idx),
+                DebeziumDecodeState2::AtAfterSubfield(idx) => (&mut $self.after_state, idx),
+                _ => todo!("give_datum state: {:?}", $self.state),
+            };
+            if row_state.next == datum_idx {
+                // The happy, in-order case - just write directly into the row. No need to stash anything anywhere.
+                row_state.buf.as_mut().unwrap().extend(Some(datum));
+                row_state.next += 1;
+            } else {
+                // This is the case when fields are in a different order in the reader schema from
+                // the writer schema.
+                //
+                // TODO - do something smart to avoid the allocations/clones here if people complain. It won't matter much
+                // for scalar columns. Maybe for non-scalars (e.g. string) we can create one allocation per column and reuse it.
+                row_state.stash.push((datum_idx, StashItem::OwnedDatum(datum.to_owned())));
+            }
+            $self.state = match $self.state {
+                DebeziumDecodeState2::AtBeforeSubfield(_) => DebeziumDecodeState2::InBeforeRecord,
+                DebeziumDecodeState2::AtAfterSubfield(_) => DebeziumDecodeState2::InAfterRecord,
+                _ => unreachable!()
+            }
         }
     };
 }
@@ -614,9 +621,14 @@ impl AvroDecode for DebeziumAvroDecoder {
         use DebeziumDecodeState2::*;
         self.state = match self.state {
             Start => InRootRecord,
-            AtEnvelopeField => InEnvelopeRecord,
-            AtBeforeField => InBeforeRecord,
-            AtAfterField => InAfterRecord,
+            AtBeforeField => {
+                self.before_present = true;
+                InBeforeRecord
+            }
+            AtAfterField => {
+                self.after_present = true;
+                InAfterRecord
+            }
             AtAfterSubfield(_) | AtBeforeSubfield(_) => {
                 bail!("Nested record types are not yet supported in Materialize.");
             }
@@ -628,25 +640,18 @@ impl AvroDecode for DebeziumAvroDecoder {
             InSourceOther { depth } => InSourceOther { depth: depth + 1 },
             AtOtherField => InOtherField { depth: 0 },
             InOtherField { depth } => InOtherField { depth: depth + 1 },
-            End | InRootRecord | InEnvelopeRecord | InBeforeRecord | InAfterRecord
-            | InSourceRecord => unreachable!(),
-            _ => todo!(),
+            End | InRootRecord | InBeforeRecord | InAfterRecord | InSourceRecord => unreachable!(),
+            _ => todo!("begin_record state: {:?}", self.state),
         };
         Ok(())
     }
     fn record_field(&mut self, name: &str, position: usize) -> Result<()> {
         use DebeziumDecodeState2::*;
         self.state = match (name, self.state) {
-            ("envelope", InRootRecord) => AtEnvelopeField,
-            ("before", InEnvelopeRecord) => {
-                self.before_present = true;
-                AtBeforeField
-            }
-            ("after", InEnvelopeRecord) => {
-                self.after_present = true;
-                AtAfterField
-            }
-            (_, InEnvelopeRecord) => AtOtherField,
+            ("before", InRootRecord) => AtBeforeField,
+            ("after", InRootRecord) => AtAfterField,
+            ("source", InRootRecord) => AtSourceField,
+            (_, InRootRecord) => AtOtherField,
             (_, InBeforeRecord) => AtBeforeSubfield(position),
             (_, InAfterRecord) => AtAfterSubfield(position),
             ("file", InSourceRecord) => AtSourceFile,
@@ -680,7 +685,7 @@ impl AvroDecode for DebeziumAvroDecoder {
             Start | AtEnvelopeField | AtBeforeField | AtBeforeSubfield(_) | AtAfterField
             | AtAfterSubfield(_) | AtSourceField | AtSourceFile | AtSourcePos | AtSourceRow
             | AtSourceSnapshot | AtSourceOther | AtOtherField | End => unreachable!(),
-            _ => todo!(),
+            _ => todo!("end_record state: {:?}", self.state),
         };
         Ok(())
     }
@@ -688,7 +693,7 @@ impl AvroDecode for DebeziumAvroDecoder {
         use DebeziumDecodeState2::*;
         self.state = match self.state {
             // look through the union
-            AtBeforeField | AtAfterField => self.state,
+            AtBeforeField | AtAfterField | AtSourceSnapshot => self.state,
             AtBeforeSubfield(field_idx) => AtBeforeUnion {
                 field_idx,
                 variant_idx,
@@ -698,7 +703,7 @@ impl AvroDecode for DebeziumAvroDecoder {
                 variant_idx,
             },
             AtSourceOther | InSourceOther { .. } | AtOtherField | InOtherField { .. } => self.state,
-            _ => todo!(),
+            _ => todo!("union_branch state: {:?}", self.state),
         };
         Ok(())
     }
@@ -775,9 +780,39 @@ impl AvroDecode for DebeziumAvroDecoder {
     fn scalar(&mut self, s: Scalar) -> Result<()> {
         use DebeziumDecodeState2::*;
         match (self.state, s) {
-//            (AtSourcePos, Scalar::Int(i)) => self.k
+            (AtBeforeField, Scalar::Null) | (AtAfterField, Scalar::Null) => {
+                self.state = InRootRecord;
+            }
+            (AtSourceFile, Scalar::Null) => {
+                self.state = InSourceRecord;
+            }
+            (AtSourcePos, Scalar::Int(i)) => {
+                self.pos = Some(i as usize);
+                self.state = InSourceRecord
+            }
+            (AtSourceRow, Scalar::Int(i)) => {
+                self.row = Some(i as usize);
+                self.state = InSourceRecord
+            }
+            (AtSourcePos, Scalar::Long(i)) => {
+                self.pos = Some(i as usize);
+                self.state = InSourceRecord
+            }
+            (AtSourceRow, Scalar::Long(i)) => {
+                self.row = Some(i as usize);
+                self.state = InSourceRecord
+            }
+            (AtSourceSnapshot, Scalar::Boolean(b)) => {
+                self.snapshot = Some(b);
+                self.state = InSourceRecord
+            }
+            (AtBeforeSubfield(_), s) | (AtAfterSubfield(_), s) => give_datum!(self, s.into()),
+            (AtOtherField, _)
+            | (InOtherField { .. }, _)
+            | (AtSourceOther, _)
+            | (InSourceOther { .. }, _) => {}
+            _ => bail!("Unexpected scalar {:?} at {:?}", s, self.state),
         }
-        give_datum!(self, s.into());
         Ok(())
     }
     fn decimal<'b, R: Read + Skip>(
@@ -786,7 +821,7 @@ impl AvroDecode for DebeziumAvroDecoder {
         scale: usize,
         r: ValueOrReader<'b, &'b [u8], R>,
     ) -> Result<()> {
-        todo!()
+        todo!("decimal state: {:?}", self.state);
     }
     fn bytes<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<()> {
         let d = match r {
@@ -801,23 +836,64 @@ impl AvroDecode for DebeziumAvroDecoder {
         Ok(())
     }
     fn string<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b str, R>) -> Result<()> {
-        let d = match r {
-            ValueOrReader::Value(s) => Datum::String(s),
-            ValueOrReader::Reader { len, r } => {
-                self.scratch.resize_with(len, Default::default);
-                r.read_exact(&mut self.scratch)?;
-                let s = std::str::from_utf8(&self.scratch)?;
-                Datum::String(s)
+        use DebeziumDecodeState2::*;
+        match self.state {
+            AtBeforeSubfield(_) | AtAfterSubfield(_) => {
+                let d = match r {
+                    ValueOrReader::Value(s) => Datum::String(s),
+                    ValueOrReader::Reader { len, r } => {
+                        self.scratch.resize_with(len, Default::default);
+                        r.read_exact(&mut self.scratch)?;
+                        let s = std::str::from_utf8(&self.scratch)?;
+                        Datum::String(s)
+                    }
+                };
+                give_datum!(self, d);
             }
-        };
-        give_datum!(self, d);
+            AtSourceSnapshot => {
+                let s = match r {
+                    ValueOrReader::Value(s) => s,
+                    ValueOrReader::Reader { len, r } => {
+                        self.scratch.resize_with(len, Default::default);
+                        r.read_exact(&mut self.scratch)?;
+                        std::str::from_utf8(&self.scratch)?
+                    }
+                };
+                self.snapshot = Some(match s {
+                    "last" | "true" => true,
+                    "false" => false,
+                    _ => bail!("Unknown snapshot value: {}", s),
+                });
+            }
+            AtSourceFile => {
+                match r {
+                    ValueOrReader::Value(s) => {
+                        self.file_buf.clear();
+                        self.file_buf.extend_from_slice(s.as_bytes());
+                    }
+                    ValueOrReader::Reader { len, r } => {
+                        self.file_buf.resize_with(len, Default::default);
+                        r.read_exact(&mut self.file_buf)?;
+                    }
+                }
+                self.state = InSourceRecord;
+            }
+            _ => bail!("Unexpected string"),
+        }
         Ok(())
     }
     fn json<'b, R: Read + Skip>(
         &mut self,
         r: ValueOrReader<'b, &'b serde_json::Value, R>,
     ) -> Result<()> {
-        todo!()
+        //todo!()
+        match r {
+            ValueOrReader::Reader { len, r } => r.skip(len)?,
+            _ => {}
+        }
+        log::error!("Giving fake json");
+        give_datum!(self, Datum::List(DatumList::empty()));
+        Ok(())
     }
     fn fixed<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<()> {
         bail!("`fixed` types are not supported.")
@@ -1008,7 +1084,7 @@ pub struct Decoder {
     reader_schema: Schema,
     writer_schemas: Option<SchemaCache>,
     envelope: EnvelopeType,
-    debezium: Option<DebeziumDecodeState>,
+    debezium: Option<DebeziumAvroDecoder>,
 }
 
 impl fmt::Debug for Decoder {
@@ -1047,11 +1123,16 @@ impl Decoder {
         let writer_schemas =
             schema_registry.map(|sr| SchemaCache::new(sr, reader_schema.fingerprint::<Sha256>()));
 
+        // let debezium = if envelope == EnvelopeType::Debezium {
+        //     Some(
+        //         DebeziumDecodeState::new(&reader_schema, debug_name, worker_index)
+        //             .ok_or_else(|| format_err!("Failed to extract Debezium schema information!"))?,
+        //     )
+        // } else {
+        //     None
+        // };
         let debezium = if envelope == EnvelopeType::Debezium {
-            Some(
-                DebeziumDecodeState::new(&reader_schema, debug_name, worker_index)
-                    .ok_or_else(|| format_err!("Failed to extract Debezium schema information!"))?,
-            )
+            Some(DebeziumAvroDecoder::new())
         } else {
             None
         };
@@ -1096,11 +1177,13 @@ impl Decoder {
         };
 
         let result = if self.envelope == EnvelopeType::Debezium {
-            let dbz_state = self.debezium.as_mut().ok_or_else(|| {
-                format_err!("Debezium schema extraction failed; can't decode message.")
-            })?;
-            let val = avro::from_avro_datum(resolved_schema, &mut bytes)?;
-            dbz_state.extract(val, self.reader_schema.top_node(), coord)?
+            let dbz = self.debezium.as_mut().unwrap();
+            let res = avro::decode_new(resolved_schema.top_node(), &mut bytes, dbz);
+            let dp = dbz.finish();
+            res?;
+            dp
+        //   let val = avro::from_avro_datum(resolved_schema, &mut bytes)?;
+        //   dbz_state.extract(val, self.reader_schema.top_node(), coord)?
         } else {
             let val = avro::from_avro_datum(resolved_schema, &mut bytes)?;
             let row = extract_row(val, iter::empty(), self.reader_schema.top_node())?;
