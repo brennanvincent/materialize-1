@@ -616,6 +616,29 @@ macro_rules! give_datum {
         }
     };
 }
+fn pop(state: DebeziumDecodeState2) -> DebeziumDecodeState2 {
+    use DebeziumDecodeState2::*;
+    match state {
+        InRootRecord => End,
+        AtOtherField | InBeforeRecord | InAfterRecord | InSourceRecord => InRootRecord,
+        InSourceOther { depth } => {
+            if depth > 0 {
+                InSourceOther { depth: depth - 1 }
+            } else {
+                InSourceRecord
+            }
+        }
+        InOtherField { depth } => {
+            if depth > 0 {
+                InOtherField { depth: depth - 1 }
+            } else {
+                InRootRecord
+            }
+        }
+        AtSourceOther => InSourceRecord,
+        _ => state,
+    }
+}
 impl AvroDecode for DebeziumAvroDecoder {
     fn begin_record(&mut self) -> Result<()> {
         use DebeziumDecodeState2::*;
@@ -810,7 +833,7 @@ impl AvroDecode for DebeziumAvroDecoder {
             (AtOtherField, _)
             | (InOtherField { .. }, _)
             | (AtSourceOther, _)
-            | (InSourceOther { .. }, _) => {}
+            | (InSourceOther { .. }, _) => self.state = pop(self.state),
             _ => bail!("Unexpected scalar {:?} at {:?}", s, self.state),
         }
         Ok(())
@@ -821,7 +844,18 @@ impl AvroDecode for DebeziumAvroDecoder {
         scale: usize,
         r: ValueOrReader<'b, &'b [u8], R>,
     ) -> Result<()> {
-        todo!("decimal state: {:?}", self.state);
+        let significand = match r {
+            ValueOrReader::Value(b) => b,
+            ValueOrReader::Reader { len, r } => {
+                self.scratch.resize_with(len, Default::default);
+                r.read_exact(&mut self.scratch)?;
+                &self.scratch
+            }
+        };
+        let d = Datum::Decimal(Significand::from_twos_complement_be(significand)?);
+        // skip others?
+        give_datum!(self, d);
+        Ok(())
     }
     fn bytes<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<()> {
         let d = match r {
@@ -837,28 +871,20 @@ impl AvroDecode for DebeziumAvroDecoder {
     }
     fn string<'b, R: Read + Skip>(&mut self, r: ValueOrReader<'b, &'b str, R>) -> Result<()> {
         use DebeziumDecodeState2::*;
+        let s = match r {
+            ValueOrReader::Value(s) => s,
+            ValueOrReader::Reader { len, r } => {
+                self.scratch.resize_with(len, Default::default);
+                r.read_exact(&mut self.scratch)?;
+                let s = std::str::from_utf8(&self.scratch)?;
+                s
+            }
+        };
         match self.state {
             AtBeforeSubfield(_) | AtAfterSubfield(_) => {
-                let d = match r {
-                    ValueOrReader::Value(s) => Datum::String(s),
-                    ValueOrReader::Reader { len, r } => {
-                        self.scratch.resize_with(len, Default::default);
-                        r.read_exact(&mut self.scratch)?;
-                        let s = std::str::from_utf8(&self.scratch)?;
-                        Datum::String(s)
-                    }
-                };
-                give_datum!(self, d);
+                give_datum!(self, Datum::String(s));
             }
             AtSourceSnapshot => {
-                let s = match r {
-                    ValueOrReader::Value(s) => s,
-                    ValueOrReader::Reader { len, r } => {
-                        self.scratch.resize_with(len, Default::default);
-                        r.read_exact(&mut self.scratch)?;
-                        std::str::from_utf8(&self.scratch)?
-                    }
-                };
                 self.snapshot = Some(match s {
                     "last" | "true" => true,
                     "false" => false,
@@ -866,19 +892,14 @@ impl AvroDecode for DebeziumAvroDecoder {
                 });
             }
             AtSourceFile => {
-                match r {
-                    ValueOrReader::Value(s) => {
-                        self.file_buf.clear();
-                        self.file_buf.extend_from_slice(s.as_bytes());
-                    }
-                    ValueOrReader::Reader { len, r } => {
-                        self.file_buf.resize_with(len, Default::default);
-                        r.read_exact(&mut self.file_buf)?;
-                    }
-                }
+                self.file_buf.clear();
+                self.file_buf.extend_from_slice(s.as_bytes());
                 self.state = InSourceRecord;
             }
-            _ => bail!("Unexpected string"),
+            AtOtherField | InOtherField { .. } | AtSourceOther | InSourceOther { .. } => {
+                self.state = pop(self.state)
+            }
+            _ => bail!("Unexpected string at state {:?}", self.state),
         }
         Ok(())
     }
