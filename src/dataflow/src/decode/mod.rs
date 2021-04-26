@@ -11,11 +11,17 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::{any::Any, cell::RefCell, collections::VecDeque, rc::Rc, time::Duration};
 
-use anyhow::{anyhow, bail};
+use ::regex::Regex;
+use anyhow::anyhow;
+use anyhow::bail;
+use dataflow_types::AvroEncoding;
+use dataflow_types::AvroOcfEncoding;
+use dataflow_types::ProtobufEncoding;
 use differential_dataflow::capture::YieldingIter;
 use differential_dataflow::{AsCollection, Collection};
 use expr::SourceInstanceId;
 use futures::executor::block_on;
+use interchange::protobuf::Decoder;
 use mz_avro::{AvroDeserializer, GeneralDeserializer};
 use prometheus::UIntGauge;
 use timely::dataflow::channels::pact::ParallelizationContract;
@@ -33,10 +39,14 @@ use log::error;
 use repr::Datum;
 use repr::{Diff, Row, Timestamp};
 
+use self::avro::AvroDecoderState;
 use self::csv::csv;
+use self::csv::CsvDecoderState;
 use self::key_value::KeyValueDecoder;
+use self::protobuf::ProtobufDecoderState;
 use self::regex::regex as regex_fn;
 use crate::operator::StreamExt;
+use crate::source::DecodeResult;
 use crate::source::SourceOutput;
 
 mod avro;
@@ -45,78 +55,6 @@ mod key_value;
 mod metrics;
 mod protobuf;
 mod regex;
-
-/// Decode for the special case of Avro OCFs
-pub fn decode_avro_values<G>(
-    stream: &Stream<G, SourceOutput<Vec<u8>, Value>>,
-    envelope: &SourceEnvelope,
-    schema: Schema,
-    debug_name: &str,
-) -> (
-    Collection<G, Row, Diff>,
-    Option<Collection<G, dataflow_types::DataflowError, Diff>>,
-)
-where
-    G: Scope<Timestamp = Timestamp>,
-{
-    // TODO(brennan) -- If this ends up being a bottleneck,
-    // refactor the avro `Reader` to separate reading from decoding,
-    // so that we can spread the decoding among all the workers.
-    // See #2133
-    let envelope = envelope.clone();
-    let mut dbz_state = match envelope {
-        SourceEnvelope::Debezium(dedup_strat, DebeziumMode::Plain) => DebeziumDecodeState::new(
-            &schema,
-            debug_name.to_string(),
-            stream.scope().index(),
-            dedup_strat,
-        ),
-        SourceEnvelope::Debezium(_, DebeziumMode::Upsert) => {
-            error!("Upsert doesn't make sense for Avro OCFs because they don't have keys");
-            None
-        }
-        _ => None,
-    };
-
-    let stream = stream.pass_through("AvroValues").flat_map(
-        move |(
-            SourceOutput {
-                value,
-                position: index,
-                upstream_time_millis,
-                key: _,
-            },
-            r,
-            d,
-        )| {
-            let top_node = schema.top_node();
-            let maybe_row = match envelope {
-                SourceEnvelope::None => extract_row(value, index.map(Datum::from), top_node),
-                SourceEnvelope::Debezium(_, _) => {
-                    if let Some(dbz_state) = dbz_state.as_mut() {
-                        dbz_state.extract(value, upstream_time_millis)
-                    } else {
-                        Err(anyhow!(
-                            "No debezium schema information -- could not decode row"
-                        ))
-                    }
-                }
-                SourceEnvelope::Upsert => unreachable!("Upsert is not supported for AvroOCF"),
-                SourceEnvelope::CdcV2 => unreachable!("CDC envelope is not supported for AvroOCF"),
-            }
-            .unwrap_or_else(|e| {
-                // TODO(#489): Handle this in a better way,
-                // once runtime error handling exists.
-                error!("Failed to extract avro row: {}", e);
-                None
-            });
-
-            maybe_row.into_iter().map(move |row| (row, r, d))
-        },
-    );
-
-    (stream.as_collection(), None)
-}
 
 pub trait DecoderState {
     fn decode_key(&mut self, bytes: &[u8]) -> Result<Option<Row>, String>;
@@ -232,6 +170,7 @@ fn get_decoder_inner(
                 false,
                 "Avro".to_string(), // op_name().to_string() can't be called because of double-borrow
                 enc.confluent_wire_format,
+                false,
             )
             .expect("Failed to create Avro decoder"),
         ),
@@ -380,6 +319,369 @@ fn decode_cdcv2<G: Scope<Timestamp = Timestamp>>(
     ((stream.as_collection(), None), Some(token))
 }
 
+// These don't know how to find delimiters --
+// they just go from sequences of vectors of bytes (for which we already know the delimiters)
+// to rows, and can eventually just be planned as `HirRelationExpr::Map`. (TODO)
+#[derive(Debug)]
+enum PreDelimitedFormat {
+    Bytes,
+    Text,
+    Regex(Regex, Row),
+    Protobuf(ProtobufDecoderState),
+}
+
+impl PreDelimitedFormat {
+    pub fn decode(
+        &mut self,
+        bytes: &[u8],
+        upstream_coord: Option<i64>,
+    ) -> Result<Option<Row>, DataflowError> {
+        match self {
+            PreDelimitedFormat::Bytes => Ok(Some(Row::pack(Some(Datum::Bytes(bytes))))),
+            PreDelimitedFormat::Text => {
+                let s = std::str::from_utf8(bytes)
+                    .map_err(|_| DecodeError::Text("Failed to decode UTF-8".to_string()))?;
+                Ok(Some(Row::pack(Some(Datum::String(s)))))
+            }
+            PreDelimitedFormat::Regex(regex, row_packer) => {
+                let s = std::str::from_utf8(bytes)
+                    .map_err(|_| DecodeError::Text("Failed to decode UTF-8".to_string()))?;
+                let captures = match regex.captures(s) {
+                    Some(captures) => captures,
+                    None => return Ok(None),
+                };
+                row_packer.extend(
+                    captures
+                        .iter()
+                        .skip(1)
+                        .map(|c| Datum::from(c.map(|c| c.as_str()))),
+                );
+                row_packer.push(Datum::from(upstream_coord));
+                Ok(Some(row_packer.finish_and_reuse()))
+            }
+            PreDelimitedFormat::Protobuf(pb) => {
+                pb.get_value(bytes, upstream_coord, None).transpose()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DataDecoderInner {
+    Avro(AvroDecoderState),
+    DelimitedBytes {
+        delimiter: u8,
+        format: PreDelimitedFormat,
+    },
+    Csv(CsvDecoderState),
+
+    PreDelimited(PreDelimitedFormat),
+}
+
+#[derive(Debug)]
+struct DataDecoder {
+    inner: DataDecoderInner,
+}
+
+impl DataDecoder {
+    pub fn next(
+        &mut self,
+        bytes: &mut &[u8],
+        upstream_coord: Option<i64>,
+        upstream_time_millis: Option<i64>,
+    ) -> Result<Option<Row>, DataflowError> {
+        match &mut self.inner {
+            DataDecoderInner::DelimitedBytes { delimiter, format } => {
+                let delimiter = *delimiter;
+                let chunk_idx = match bytes.iter().position(move |&byte| byte == delimiter) {
+                    None => return Ok(None),
+                    Some(i) => i,
+                };
+                let data = &bytes[0..chunk_idx];
+                format.decode(data, upstream_coord)
+            }
+            DataDecoderInner::Avro(avro) => {
+                avro.get_value2(bytes, upstream_coord, upstream_time_millis)
+            }
+            DataDecoderInner::Csv(csv) => csv.next(bytes),
+            DataDecoderInner::PreDelimited(format) => {
+                let result = format.decode(*bytes, upstream_coord);
+                *bytes = &[];
+                result
+            }
+        }
+    }
+}
+
+fn get_decoder2(
+    encoding: DataEncoding,
+    debug_name: &str,
+    envelope: &SourceEnvelope,
+    // Information about optional transformations that can be eagerly done.
+    // If the decoding elects to perform them, it should replace this with
+    // `None`.
+    operators: &mut Option<LinearOperator>,
+    fast_forwarded: bool,
+    source_id: SourceInstanceId,
+    is_connector_delimited: bool,
+) -> DataDecoder {
+    match encoding {
+        DataEncoding::Avro(AvroEncoding {
+            schema,
+            schema_registry_config,
+            confluent_wire_format,
+        }) => {
+            match envelope {
+                SourceEnvelope::Debezium(_, mode) => {
+                    let state = avro::AvroDecoderState::new(
+                        &schema,
+                        schema_registry_config,
+                        envelope.get_avro_envelope_type(),
+                        fast_forwarded && !matches!(mode, DebeziumMode::Upsert), // `start_offset` should work fine for `DEBEZIUM UPSERT`.
+                        debug_name.to_string(),
+                        confluent_wire_format,
+                        false,
+                    )
+                    .expect("Failed to create avro decoder");
+                    DataDecoder {
+                        inner: DataDecoderInner::Avro(state),
+                    }
+                }
+
+                _ => {
+                    let state = avro::AvroDecoderState::new(
+                        &schema,
+                        schema_registry_config,
+                        envelope.get_avro_envelope_type(),
+                        false,
+                        debug_name.to_string(),
+                        confluent_wire_format,
+                        false,
+                    )
+                    .expect("Failed to create avro decoder");
+                    DataDecoder {
+                        inner: DataDecoderInner::Avro(state),
+                    }
+                }
+            }
+        }
+        DataEncoding::Text
+        | DataEncoding::Bytes
+        | DataEncoding::Protobuf(_)
+        | DataEncoding::Regex(_) => {
+            let after_delimiting = match encoding {
+                DataEncoding::Regex(RegexEncoding { regex }) => {
+                    PreDelimitedFormat::Regex(regex, Default::default())
+                }
+                DataEncoding::Protobuf(ProtobufEncoding {
+                    descriptors,
+                    message_name,
+                }) => PreDelimitedFormat::Protobuf(ProtobufDecoderState::new(
+                    &descriptors,
+                    &message_name,
+                )),
+                DataEncoding::Bytes => PreDelimitedFormat::Bytes,
+                DataEncoding::Text => PreDelimitedFormat::Text,
+                _ => unreachable!(),
+            };
+            let inner = if is_connector_delimited {
+                DataDecoderInner::PreDelimited(after_delimiting)
+            } else {
+                DataDecoderInner::DelimitedBytes {
+                    delimiter: b'\n',
+                    format: after_delimiting,
+                }
+            };
+            DataDecoder { inner }
+        }
+        DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema }) => match envelope {
+            SourceEnvelope::Debezium(_, mode) => {
+                let state = avro::AvroDecoderState::new(
+                    &reader_schema,
+                    None,
+                    envelope.get_avro_envelope_type(),
+                    fast_forwarded,
+                    debug_name.to_string(),
+                    false,
+                    true,
+                )
+                .expect("Failed to create avro decoder");
+                DataDecoder {
+                    inner: DataDecoderInner::Avro(state),
+                }
+            }
+
+            SourceEnvelope::None => {
+                let state = avro::AvroDecoderState::new(
+                    &reader_schema,
+                    None,
+                    envelope.get_avro_envelope_type(),
+                    false,
+                    debug_name.to_string(),
+                    false,
+                    true,
+                )
+                .expect("Failed to create avro decoder");
+                DataDecoder {
+                    inner: DataDecoderInner::Avro(state),
+                }
+            }
+            _ => todo!(),
+        },
+        DataEncoding::Csv(enc) => {
+            let state = CsvDecoderState::new(enc, operators);
+            DataDecoder {
+                inner: DataDecoderInner::Csv(state),
+            }
+        }
+        DataEncoding::Postgres(_) => unreachable!("xxx"),
+    }
+}
+
+pub fn render_decode<G>(
+    stream: &Stream<G, SourceOutput<Vec<u8>, Vec<u8>>>,
+    key_encoding: Option<DataEncoding>,
+    value_encoding: DataEncoding,
+    is_connector_delimited: bool,
+    debug_name: &str,
+    envelope: &SourceEnvelope,
+    // Information about optional transformations that can be eagerly done.
+    // If the decoding elects to perform them, it should replace this with
+    // `None`.
+    operators: &mut Option<LinearOperator>,
+    fast_forwarded: bool,
+    source_id: SourceInstanceId,
+    push_object_number: bool,
+) -> (Stream<G, DecodeResult>, Option<Box<dyn Any>>)
+where
+    G: Scope<Timestamp = Timestamp>,
+{
+    let op_name = format!(
+        "{}{}Decode",
+        key_encoding
+            .as_ref()
+            .map(|key_encoding| key_encoding.op_name())
+            .unwrap_or(""),
+        value_encoding.op_name()
+    );
+    let mut key_decoder = key_encoding.map(|key_encoding| {
+        get_decoder2(
+            key_encoding,
+            debug_name,
+            envelope,
+            operators,
+            false,
+            source_id,
+            is_connector_delimited,
+        )
+    });
+    let mut value_decoder = get_decoder2(
+        value_encoding,
+        debug_name,
+        envelope,
+        operators,
+        fast_forwarded,
+        source_id,
+        is_connector_delimited,
+    );
+
+    let mut value_buf = vec![];
+
+    // XXX[btv] how to choose the contract?
+    let results = stream.unary(
+        SourceOutput::<Vec<u8>, Vec<u8>>::key_contract(),
+        &op_name,
+        move |_, _| {
+            move |input, output| {
+                input.for_each(|cap, data| {
+                    let mut session = output.session(&cap);
+                    for SourceOutput {
+                        key,
+                        value,
+                        position,
+                        upstream_time_millis,
+                    } in data.iter()
+                    {
+                        let key_cursor = &mut key.as_slice();
+                        let key = if let (Some(key_decoder), false) =
+                            (key_decoder.as_mut(), key.is_empty())
+                        {
+                            let key = match key_decoder.next(
+                                key_cursor,
+                                *position,
+                                *upstream_time_millis,
+                            ) {
+                                Ok(None) => None,
+                                Ok(Some(key)) => Some(Ok(key)),
+                                Err(e) => Some(Err(e)),
+                            };
+                            if !key_cursor.is_empty() {
+                                panic!("XXX[btv] multiple keys does not make sense");
+                            }
+                            key
+                        } else {
+                            None
+                        };
+
+                        let value = if value_buf.is_empty() {
+                            value
+                        } else {
+                            value_buf.extend_from_slice(&*value);
+                            &value_buf
+                        };
+                        if value.is_empty() {
+                            session.give(DecodeResult {
+                                key,
+                                value: None,
+                                position: *position,
+                            });
+                        } else {
+                            let value_cursor = &mut value.as_slice();
+                            loop {
+                                let mut value = match value_decoder.next(
+                                    value_cursor,
+                                    *position,
+                                    *upstream_time_millis,
+                                ) {
+                                    Err(e) => {
+                                        Err(e) // XXX think about this
+                                    }
+                                    Ok(None) => {
+                                        let leftover = value_cursor.to_vec();
+                                        value_buf = leftover;
+                                        break;
+                                    }
+                                    Ok(Some(value)) => Ok(value),
+                                };
+                                // XXX think about this
+                                if let (Ok(value), true) = (&mut value, push_object_number) {
+                                    value.push(Datum::from(*position));
+                                }
+                                if value_cursor.is_empty() {
+                                    session.give(DecodeResult {
+                                        key,
+                                        value: Some(value),
+                                        position: *position,
+                                    });
+                                    value_buf = vec![];
+                                    break;
+                                } else {
+                                    session.give(DecodeResult {
+                                        key: key.clone(),
+                                        value: Some(value),
+                                        position: *position,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        },
+    );
+    (results, None)
+}
+
 /// Decode a stream of values from a stream of bytes.
 /// Returns the corresponding stream of Row/Timestamp/Diff tuples,
 /// and, optionally, a token that can be dropped to stop the decoding operator
@@ -491,6 +793,7 @@ where
                     fast_forwarded && !matches!(mode, DebeziumMode::Upsert), // `start_offset` should work fine for `DEBEZIUM UPSERT`.
                     debug_name.to_string(),
                     enc.confluent_wire_format,
+                    false,
                 )
                 .expect("Failed to create Avro decoder"),
                 &op_name,
@@ -510,6 +813,7 @@ where
                     fast_forwarded,
                     debug_name.to_string(),
                     enc.confluent_wire_format,
+                    false,
                 )
                 .expect("Failed to create Avro decoder"),
                 &op_name,

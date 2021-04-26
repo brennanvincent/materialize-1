@@ -9,6 +9,7 @@
 
 use std::iter;
 
+use dataflow_types::CsvEncoding;
 use dataflow_types::LinearOperator;
 
 use differential_dataflow::{AsCollection, Collection};
@@ -19,6 +20,146 @@ use dataflow_types::{DataflowError, DecodeError};
 use repr::{Datum, Diff, Row, Timestamp};
 
 use crate::{metrics::EVENTS_COUNTER, source::SourceOutput};
+
+#[derive(Debug)]
+pub struct CsvDecoderState {
+    header_row: bool,
+    n_cols: usize,
+    output: Vec<u8>,
+    output_cursor: usize,
+    ends: Vec<usize>,
+    ends_cursor: usize,
+    csv_reader: csv_core::Reader,
+    demanded: Vec<bool>,
+    row_packer: Row,
+    events_error: usize,
+    events_success: usize,
+}
+
+impl CsvDecoderState {
+    fn total_events(&self) -> usize {
+        self.events_error + self.events_success
+    }
+
+    pub fn new(format: CsvEncoding, operators: &mut Option<LinearOperator>) -> Self {
+        let CsvEncoding {
+            header_row,
+            n_cols,
+            delimiter,
+        } = format;
+
+        let operators = operators.take();
+        let demanded = (0..n_cols)
+            .map(move |c| {
+                operators
+                    .as_ref()
+                    .map(|o| o.projection.contains(&c))
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            header_row,
+            n_cols,
+            output: vec![0],
+            output_cursor: 0,
+            ends: vec![0],
+            ends_cursor: 1,
+            csv_reader: csv_core::ReaderBuilder::new().delimiter(delimiter).build(),
+            demanded,
+            row_packer: Default::default(),
+            events_error: 0,
+            events_success: 0,
+        }
+    }
+
+    pub fn next(&mut self, chunk: &mut &[u8]) -> Result<Option<Row>, DataflowError> {
+        loop {
+            let lossy_chunk = String::from_utf8_lossy(*chunk);
+            println!(
+                "reading chunk: {}. output: {}. ends: {:?}",
+                lossy_chunk,
+                String::from_utf8_lossy(&self.output[0..self.output_cursor]),
+                &self.ends[0..self.ends_cursor]
+            );
+            let (result, n_input, n_output, n_ends) = self.csv_reader.read_record(
+                *chunk,
+                &mut self.output[self.output_cursor..],
+                &mut self.ends[self.ends_cursor..],
+            );
+            self.output_cursor += n_output;
+            *chunk = &(*chunk)[n_input..];
+            self.ends_cursor += n_ends;
+            match result {
+                csv_core::ReadRecordResult::InputEmpty => break Ok(None),
+                csv_core::ReadRecordResult::OutputFull => {
+                    let length = self.output.len();
+                    self.output.extend(std::iter::repeat(0).take(length));
+                }
+                csv_core::ReadRecordResult::OutputEndsFull => {
+                    let length = self.ends.len();
+                    self.ends.extend(std::iter::repeat(0).take(length));
+                }
+                csv_core::ReadRecordResult::Record | csv_core::ReadRecordResult::End => {
+                    let result = {
+                        let ends_valid = self.ends_cursor - 1;
+                        if ends_valid != self.n_cols {
+                            self.events_error += 1;
+                            Err(DataflowError::DecodeError(DecodeError::Text(format!(
+                                "CSV error at lineno {}: expected {} columns, got {}.",
+                                self.total_events(),
+                                self.n_cols,
+                                ends_valid
+                            ))))
+                        } else {
+                            match std::str::from_utf8(&self.output[0..self.output_cursor]) {
+                                Ok(output) => {
+                                    self.events_success += 1;
+                                    let mut row_packer = std::mem::take(&mut self.row_packer);
+                                    row_packer.extend(
+                                        (0..self.n_cols)
+                                            .map(|i| {
+                                                Datum::String(if self.demanded[i] {
+                                                    &output[self.ends[i]..self.ends[i + 1]]
+                                                } else {
+                                                    ""
+                                                })
+                                            })
+                                            .chain(iter::once(Datum::Int64(
+                                                self.total_events() as i64
+                                            ))),
+                                    );
+                                    self.row_packer = row_packer;
+                                    self.output_cursor = 0;
+                                    self.ends_cursor = 1;
+                                    Ok(Some(self.row_packer.finish_and_reuse()))
+                                }
+                                Err(_) => {
+                                    self.events_error += 1;
+                                    Err(DataflowError::DecodeError(DecodeError::Text(format!(
+                                        "CSV error at lineno {}: invalid UTF-8",
+                                        self.total_events()
+                                    ))))
+                                }
+                            }
+                        }
+                    };
+                    println!("Result: {:?}", result);
+                    if self.header_row {
+                        println!("Returning nothing, due to header row");
+                        self.header_row = false;
+                        if chunk.is_empty() {
+                            break Ok(None);
+                        }
+                    } else {
+                        println!("Returning result");
+                        break result;
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub fn csv<G>(
     stream: &Stream<G, SourceOutput<Vec<u8>, Vec<u8>>>,

@@ -16,7 +16,9 @@ use differential_dataflow::lattice::Lattice;
 use differential_dataflow::{collection, AsCollection, Collection};
 use log::warn;
 use timely::dataflow::operators::unordered_input::UnorderedInput;
+use timely::dataflow::operators::Inspect;
 use timely::dataflow::operators::Map;
+use timely::dataflow::operators::OkErr;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::Scope;
 
@@ -29,12 +31,13 @@ use repr::RelationDesc;
 use repr::ScalarType;
 use repr::{Datum, Row, Timestamp};
 
-use crate::decode::{decode_avro_values, decode_values, get_decoder};
+use crate::decode::{decode_values, get_decoder, render_decode};
 use crate::logging::materialized::Logger;
 use crate::operator::{CollectionExt, StreamExt};
 use crate::render::context::Context;
 use crate::render::RenderState;
 use crate::server::LocalInput;
+use crate::source::DecodeResult;
 use crate::source::SourceConfig;
 use crate::source::{
     self, FileSourceReader, KafkaSourceReader, KinesisSourceReader, PostgresSourceReader,
@@ -151,152 +154,129 @@ where
                     caching_tx,
                 };
 
-                // AvroOcf is a special case as its delimiters are discovered in the couse of decoding.
-                // This means that unlike the other sources, there is not a decode step that follows.
-                let (collection, capability) = if let ExternalSourceConnector::AvroOcf(_) =
-                    &connector
-                {
-                    let ((source, err_source), capability) =
-                        source::create_source::<_, FileSourceReader<Value>, Value>(
-                            source_config,
-                            &connector,
+                let (collection, capability) =
+                    if let ExternalSourceConnector::PubNub(pubnub_connector) = connector {
+                        let source = PubNubSourceReader::new(pubnub_connector);
+                        let ((ok_stream, err_stream), capability) =
+                            source::create_source_simple(source_config, source);
+
+                        error_collections.push(
+                            err_stream
+                                .map(DataflowError::SourceError)
+                                .pass_through("source-errors")
+                                .as_collection(),
                         );
 
-                    // Include any source errors.
-                    error_collections.push(
-                        err_source
-                            .map(DataflowError::SourceError)
-                            .pass_through("AvroOCF-errors")
-                            .as_collection(),
-                    );
+                        (ok_stream.as_collection(), capability)
+                    } else if let ExternalSourceConnector::Postgres(pg_connector) = connector {
+                        let source = PostgresSourceReader::new(pg_connector);
 
-                    let reader_schema = match &encoding {
-                        SourceDataEncoding::Single(DataEncoding::AvroOcf(AvroOcfEncoding {
-                            reader_schema,
-                        })) => reader_schema,
-                        _ => unreachable!(
-                            "Internal error: \
-                                     Avro OCF schema should have already been resolved.\n\
-                                    Encoding is: {:?}",
-                            encoding
-                        ),
-                    };
+                        let ((ok_stream, err_stream), capability) =
+                            source::create_source_simple(source_config, source);
 
-                    let reader_schema: Schema = reader_schema.parse().unwrap();
-                    let (collection, errors) =
-                        decode_avro_values(&source, &envelope, reader_schema, &self.debug_name);
-                    if let Some(errors) = errors {
-                        error_collections.push(errors);
-                    }
+                        error_collections.push(
+                            err_stream
+                                .map(DataflowError::SourceError)
+                                .pass_through("source-errors")
+                                .as_collection(),
+                        );
 
-                    (collection, capability)
-                } else if let ExternalSourceConnector::PubNub(pubnub_connector) = connector {
-                    let source = PubNubSourceReader::new(pubnub_connector);
-                    let ((ok_stream, err_stream), capability) =
-                        source::create_source_simple(source_config, source);
+                        (ok_stream.as_collection(), capability)
+                    } else {
+                        let is_connector_delimited = connector.is_delimited();
 
-                    error_collections.push(
-                        err_stream
-                            .map(DataflowError::SourceError)
-                            .pass_through("source-errors")
-                            .as_collection(),
-                    );
-
-                    (ok_stream.as_collection(), capability)
-                } else if let ExternalSourceConnector::Postgres(pg_connector) = connector {
-                    let source = PostgresSourceReader::new(pg_connector);
-
-                    let ((ok_stream, err_stream), capability) =
-                        source::create_source_simple(source_config, source);
-
-                    error_collections.push(
-                        err_stream
-                            .map(DataflowError::SourceError)
-                            .pass_through("source-errors")
-                            .as_collection(),
-                    );
-
-                    (ok_stream.as_collection(), capability)
-                } else {
-                    let ((ok_source, err_source), capability) = match connector {
-                        ExternalSourceConnector::Kafka(_) => {
-                            source::create_source::<_, KafkaSourceReader, _>(
-                                source_config,
-                                &connector,
-                            )
-                        }
-                        ExternalSourceConnector::Kinesis(_) => {
-                            source::create_source::<_, KinesisSourceReader, _>(
-                                source_config,
-                                &connector,
-                            )
-                        }
-                        ExternalSourceConnector::S3(_) => {
-                            source::create_source::<_, S3SourceReader, _>(source_config, &connector)
-                        }
-                        ExternalSourceConnector::File(_) => {
-                            source::create_source::<_, FileSourceReader<Vec<u8>>, Vec<u8>>(
-                                source_config,
-                                &connector,
-                            )
-                        }
-                        ExternalSourceConnector::AvroOcf(_) => unreachable!(),
-                        ExternalSourceConnector::Postgres(_) => unreachable!(),
-                        ExternalSourceConnector::PubNub(_) => unreachable!(),
-                    };
-
-                    // Include any source errors.
-                    error_collections.push(
-                        err_source
-                            .map(DataflowError::SourceError)
-                            .pass_through("source-errors")
-                            .as_collection(),
-                    );
-
-                    let (stream, errors) = if let SourceEnvelope::Upsert = &envelope {
-                        let kv_decoder = if let SourceDataEncoding::KeyValue { key, value } =
-                            encoding
-                        {
-                            get_decoder(key, value, &envelope).expect("decoder should be validated")
-                        } else {
-                            panic!("key/value decoding is required for upsert")
+                        let ((ok_source, err_source), capability) = match connector {
+                            ExternalSourceConnector::Kafka(_) => {
+                                source::create_source::<_, KafkaSourceReader, _>(
+                                    source_config,
+                                    &connector,
+                                )
+                            }
+                            ExternalSourceConnector::Kinesis(_) => {
+                                source::create_source::<_, KinesisSourceReader, _>(
+                                    source_config,
+                                    &connector,
+                                )
+                            }
+                            ExternalSourceConnector::S3(_) => {
+                                source::create_source::<_, S3SourceReader, _>(
+                                    source_config,
+                                    &connector,
+                                )
+                            }
+                            ExternalSourceConnector::File(_)
+                            | ExternalSourceConnector::AvroOcf(_) => {
+                                source::create_source::<_, FileSourceReader<Vec<u8>>, Vec<u8>>(
+                                    source_config,
+                                    &connector,
+                                )
+                            }
+                            ExternalSourceConnector::Postgres(_) => unreachable!(),
+                            ExternalSourceConnector::PubNub(_) => unreachable!(),
                         };
 
-                        super::upsert::decode_stream(
-                            &ok_source,
-                            self.as_of_frontier.clone(),
-                            kv_decoder,
-                            &mut linear_operators,
-                            src.bare_desc.typ().arity(),
-                        )
-                    } else {
-                        // TODO(brennan) -- this should just be a MirRelationExpr::FlatMap using
-                        // regexp_extract, csv_extract, a hypothetical future avro_extract,
-                        // protobuf_extract, etc.
-                        let ((stream, errors), extra_token) = decode_values(
-                            &ok_source,
-                            encoding,
-                            &self.debug_name,
-                            &envelope,
-                            &mut linear_operators,
-                            fast_forwarded,
-                            uid,
+                        // Include any source errors.
+                        error_collections.push(
+                            err_source
+                                .map(DataflowError::SourceError)
+                                .pass_through("source-errors")
+                                .as_collection(),
                         );
-                        if let Some(tok) = extra_token {
-                            self.additional_tokens
-                                .entry(src_id)
-                                .or_insert_with(Vec::new)
-                                .push(Rc::new(tok));
+
+                        let (stream, errors) = {
+                            let (key_encoding, value_encoding) = match encoding {
+                                SourceDataEncoding::KeyValue { key, value } => (Some(key), value),
+                                SourceDataEncoding::Single(value) => (None, value),
+                            };
+                            // Match historical practice. XXX think about this
+                            let push_object_number =
+                                !matches!(value_encoding, DataEncoding::Avro(_));
+                            let (results, extra_token) = render_decode(
+                                &ok_source,
+                                key_encoding,
+                                value_encoding,
+                                is_connector_delimited,
+                                &self.debug_name,
+                                &envelope,
+                                &mut linear_operators,
+                                fast_forwarded,
+                                uid,
+                                push_object_number,
+                            );
+                            let results =
+                                results.inspect(|x| println!("Post-decode result: {:?}", x));
+                            if let Some(tok) = extra_token {
+                                self.additional_tokens
+                                    .entry(src_id)
+                                    .or_insert_with(Vec::new)
+                                    .push(Rc::new(tok));
+                            }
+                            if let SourceEnvelope::Upsert = &envelope {
+                                super::upsert::decode_stream(
+                                    &results,
+                                    self.as_of_frontier.clone(),
+                                    &mut linear_operators,
+                                    src.bare_desc.typ().arity(),
+                                )
+                            } else {
+                                let (stream, errors) = results
+                                    .map(|DecodeResult { key, value, .. }| {
+                                        // assert!(key.is_none());
+                                        value.unwrap()
+                                    })
+                                    .ok_err(std::convert::identity);
+                                let stream = stream.pass_through("decode-ok").as_collection();
+                                let errors = errors.pass_through("decode-errors").as_collection();
+                                (stream, Some(errors))
+                            }
+                        };
+
+                        if let Some(errors) = errors {
+                            error_collections.push(errors);
                         }
-                        (stream, errors)
+
+                        (stream, capability)
                     };
-
-                    if let Some(errors) = errors {
-                        error_collections.push(errors);
-                    }
-
-                    (stream, capability)
-                };
 
                 // render debezium dedupe
                 let mut collection = match &envelope {

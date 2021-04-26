@@ -11,15 +11,19 @@ use futures::executor::block_on;
 
 use dataflow_types::{DataflowError, DecodeError};
 use interchange::avro::{Decoder, EnvelopeType};
+use repr::Datum;
 use repr::Row;
 
 use super::DecoderState;
 use crate::metrics::EVENTS_COUNTER;
 
+#[derive(Debug)]
 pub struct AvroDecoderState {
     decoder: Decoder,
     events_success: i64,
     events_error: i64,
+    // Whether to add the count of objects seen to the row.
+    push_object_number: bool,
 }
 
 impl AvroDecoderState {
@@ -31,6 +35,7 @@ impl AvroDecoderState {
         reject_non_inserts: bool,
         debug_name: String,
         confluent_wire_format: bool,
+        push_object_number: bool,
     ) -> Result<Self, anyhow::Error> {
         Ok(AvroDecoderState {
             decoder: Decoder::new(
@@ -43,7 +48,32 @@ impl AvroDecoderState {
             )?,
             events_success: 0,
             events_error: 0,
+            push_object_number,
         })
+    }
+
+    pub fn get_value2(
+        &mut self,
+        bytes: &mut &[u8],
+        coord: Option<i64>,
+        upstream_time_millis: Option<i64>,
+    ) -> Result<Option<Row>, DataflowError> {
+        match block_on(self.decoder.decode(bytes, coord, upstream_time_millis)) {
+            Ok(mut row) => {
+                self.events_success += 1;
+                if self.push_object_number {
+                    row.push(Datum::Int64(self.events_success))
+                }
+                Ok(Some(row))
+            }
+            Err(err) => {
+                self.events_error += 1;
+                Err(DataflowError::DecodeError(DecodeError::Text(format!(
+                    "avro deserialization error: {}",
+                    err
+                ))))
+            }
+        }
     }
 }
 
@@ -59,7 +89,8 @@ impl DecoderState for AvroDecoderState {
         coord: Option<i64>,
         upstream_time_millis: Option<i64>,
     ) -> Result<Option<Row>, String> {
-        match block_on(self.decoder.decode(bytes, coord, upstream_time_millis)) {
+        let mut bytes = bytes;
+        match block_on(self.decoder.decode(&mut bytes, coord, upstream_time_millis)) {
             Ok(row) => {
                 self.events_success += 1;
                 Ok(Some(row))
@@ -78,7 +109,8 @@ impl DecoderState for AvroDecoderState {
         coord: Option<i64>,
         upstream_time_millis: Option<i64>,
     ) -> Option<Result<Row, DataflowError>> {
-        match block_on(self.decoder.decode(bytes, coord, upstream_time_millis)) {
+        let mut bytes = bytes;
+        match block_on(self.decoder.decode(&mut bytes, coord, upstream_time_millis)) {
             Ok(row) => {
                 self.events_success += 1;
                 Some(Ok(row))

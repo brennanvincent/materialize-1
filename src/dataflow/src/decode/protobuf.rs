@@ -14,6 +14,7 @@ use repr::Row;
 use super::DecoderState;
 use crate::metrics::EVENTS_COUNTER;
 
+#[derive(Debug)]
 pub struct ProtobufDecoderState {
     decoder: Decoder,
     events_success: i64,
