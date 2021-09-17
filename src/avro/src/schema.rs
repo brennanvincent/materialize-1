@@ -28,7 +28,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::fmt;
+use std::fmt::{self, Display};
 use std::rc::Rc;
 use std::str::FromStr;
 
@@ -36,18 +36,20 @@ use digest::Digest;
 use itertools::Itertools;
 use log::{debug, warn};
 use regex::Regex;
+use serde::de::{Error, Unexpected};
+use serde::forward_to_deserialize_any;
 use serde::{
     ser::{SerializeMap, SerializeSeq},
-    Serialize, Serializer,
+    Deserialize, Deserializer, Serialize, Serializer,
 };
 use serde_json::{self, Map, Value};
 use types::{DecimalValue, Value as AvroValue};
 
 use crate::error::Error as AvroError;
 use crate::reader::SchemaResolver;
-use crate::types;
 use crate::types::AvroMap;
 use crate::util::MapHelper;
+use crate::{types, AvroRead};
 
 pub fn resolve_schemas(
     writer_schema: &Schema,
@@ -1353,6 +1355,167 @@ pub struct SchemaNode<'a> {
     pub root: &'a Schema,
     pub inner: &'a SchemaPiece,
     pub name: Option<&'a FullName>,
+}
+
+#[derive(Debug)]
+pub struct AvroDeError(String);
+
+impl serde::de::Error for AvroDeError {
+    fn custom<T>(msg: T) -> Self
+    where
+        T: fmt::Display,
+    {
+        Self(msg.to_string())
+    }
+}
+
+impl std::fmt::Display for AvroDeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AvroDeError {}
+
+impl From<std::io::Error> for AvroDeError {
+    fn from(e: std::io::Error) -> Self {
+        Self::custom(format!("{:?}", e))
+    }
+}
+
+struct AvroSerdeDeserializer<'a, R: AvroRead> {
+    schema: SchemaNode<'a>,
+    r: R,
+}
+
+use std::io::Read;
+
+// XXX - Dupe of decode.rs
+#[inline]
+pub fn decode_float<R: Read>(reader: &mut R) -> Result<f32, AvroDeError> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf[..])?;
+    Ok(f32::from_le_bytes(buf))
+}
+
+#[inline]
+pub fn decode_double<R: Read>(reader: &mut R) -> Result<f64, AvroDeError> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf[..])?;
+    Ok(f64::from_le_bytes(buf))
+}
+
+impl<'a, 'de, R> Deserializer<'de> for AvroSerdeDeserializer<'a, R>
+where
+    R: AvroRead,
+{
+    type Error = AvroDeError;
+
+    fn deserialize_any<V>(mut self, v: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        match self.schema.inner {
+            SchemaPiece::Null => v.visit_none(),
+            SchemaPiece::Boolean => {
+                let mut buf = [0u8; 1];
+                let res = self.r.read_exact(&mut buf[..])?;
+                let val = match buf[0] {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(AvroDeError::invalid_value(
+                            Unexpected::Other(&format!("Invalid boolean: {}", other)),
+                            &"0 or 1",
+                        ))
+                    }
+                };
+                v.visit_bool(val)
+            }
+            SchemaPiece::Int => {
+                let val = zag_i32(&mut self.r)?;
+                v.visit_i32(val)
+            }
+            SchemaPiece::Long => {
+                let val = zag_i64(&mut self.r)?;
+                v.visit_i64(val)
+            }
+            SchemaPiece::Float => {
+                let val = decode_float(&mut self.r)?;
+                v.visit_f32(val)
+            }
+            SchemaPiece::Double => {
+                let val = decode_double(&mut self.r)?;
+                v.visit_f64(val)
+            }
+            SchemaPiece::Date => {
+                let days = zag_i32(&mut self.r)?;
+                todo!()
+            }
+            SchemaPiece::TimestampMilli => todo!(),
+            SchemaPiece::TimestampMicro => todo!(),
+            SchemaPiece::Decimal {
+                precision,
+                scale,
+                fixed_size,
+            } => todo!(),
+            SchemaPiece::Bytes => todo!(),
+            SchemaPiece::String => todo!(),
+            SchemaPiece::Json => todo!(),
+            SchemaPiece::Uuid => todo!(),
+            SchemaPiece::Array(_) => todo!(),
+            SchemaPiece::Map(_) => todo!(),
+            SchemaPiece::Union(_) => todo!(),
+            SchemaPiece::ResolveIntTsMilli => todo!(),
+            SchemaPiece::ResolveIntTsMicro => todo!(),
+            SchemaPiece::ResolveDateTimestamp => todo!(),
+            SchemaPiece::ResolveIntLong => todo!(),
+            SchemaPiece::ResolveIntFloat => todo!(),
+            SchemaPiece::ResolveIntDouble => todo!(),
+            SchemaPiece::ResolveLongFloat => todo!(),
+            SchemaPiece::ResolveLongDouble => todo!(),
+            SchemaPiece::ResolveFloatDouble => todo!(),
+            SchemaPiece::ResolveConcreteUnion {
+                index,
+                inner,
+                n_reader_variants,
+                reader_null_variant,
+            } => todo!(),
+            SchemaPiece::ResolveUnionUnion {
+                permutation,
+                n_reader_variants,
+                reader_null_variant,
+            } => todo!(),
+            SchemaPiece::ResolveUnionConcrete { index, inner } => todo!(),
+            SchemaPiece::Record {
+                doc,
+                fields,
+                lookup,
+            } => todo!(),
+            SchemaPiece::Enum {
+                doc,
+                symbols,
+                default_idx,
+            } => todo!(),
+            SchemaPiece::Fixed { size } => todo!(),
+            SchemaPiece::ResolveRecord {
+                defaults,
+                fields,
+                n_reader_fields,
+            } => todo!(),
+            SchemaPiece::ResolveEnum {
+                doc,
+                symbols,
+                default,
+            } => todo!(),
+        }
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
+    }
 }
 
 #[derive(Copy, Clone)]

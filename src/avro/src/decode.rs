@@ -87,20 +87,6 @@ fn decode_len<R: Read>(reader: &mut R) -> Result<usize, AvroError> {
     zag_i64(reader).and_then(|i| safe_len(i as usize))
 }
 
-#[inline]
-fn decode_float<R: Read>(reader: &mut R) -> Result<f32, AvroError> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf[..])?;
-    Ok(f32::from_le_bytes(buf))
-}
-
-#[inline]
-fn decode_double<R: Read>(reader: &mut R) -> Result<f64, AvroError> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf[..])?;
-    Ok(f64::from_le_bytes(buf))
-}
-
 impl Display for TsUnit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -108,6 +94,19 @@ impl Display for TsUnit {
             TsUnit::Micros => write!(f, "us"),
         }
     }
+}
+#[inline]
+pub fn decode_float<R: Read>(reader: &mut R) -> Result<f32, AvroError> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf[..])?;
+    Ok(f32::from_le_bytes(buf))
+}
+
+#[inline]
+pub fn decode_double<R: Read>(reader: &mut R) -> Result<f64, AvroError> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf[..])?;
+    Ok(f64::from_le_bytes(buf))
 }
 
 fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, AvroError> {
