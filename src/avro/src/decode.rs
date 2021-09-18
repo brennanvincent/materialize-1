@@ -62,7 +62,7 @@ where
     }
 }
 #[inline]
-fn decode_long_nonneg<R: Read>(reader: &mut R) -> Result<u64, AvroError> {
+pub fn decode_long_nonneg<R: Read>(reader: &mut R) -> Result<u64, AvroError> {
     let u = match zag_i64(reader)? {
         i if i >= 0 => i as u64,
         i => return Err(AvroError::Decode(DecodeError::ExpectedNonnegInteger(i))),
@@ -70,7 +70,7 @@ fn decode_long_nonneg<R: Read>(reader: &mut R) -> Result<u64, AvroError> {
     Ok(u)
 }
 
-fn decode_int_nonneg<R: Read>(reader: &mut R) -> Result<u32, AvroError> {
+pub fn decode_int_nonneg<R: Read>(reader: &mut R) -> Result<u32, AvroError> {
     let u = match zag_i32(reader)? {
         i if i >= 0 => i as u32,
         i => {
@@ -83,7 +83,7 @@ fn decode_int_nonneg<R: Read>(reader: &mut R) -> Result<u32, AvroError> {
 }
 
 #[inline]
-fn decode_len<R: Read>(reader: &mut R) -> Result<usize, AvroError> {
+pub fn decode_len<R: Read>(reader: &mut R) -> Result<usize, AvroError> {
     zag_i64(reader).and_then(|i| safe_len(i as usize))
 }
 
