@@ -1400,71 +1400,50 @@ impl From<AvroError> for AvroDeError {
     }
 }
 
-struct AvroSerdeDeserializer<'a, R: AvroRead> {
+struct AvroSerdeDeserializer<'a> {
     schema: SchemaNode<'a>,
-    r: R,
+    buf: &'a [u8],
+}
+
+macro_rules! check_union {
+    ($(($func:ident, $($kind:path),*),)*) => {
+	$(fn $func<V>(mut self, visitor: V) -> Result<V::Value, Self::Error>
+	    where V: serde::de::Visitor<'de>
+	  {
+	    if let SchemaPiece::Union(inner) = self.schema.inner {
+		let index = decode_long_nonneg(&mut self.buf)? as usize;
+		let variants = inner.variants();
+		match variants.get(index) {
+		    None => Err(AvroDeError::custom(format!(
+			"Bad union index: {} (vaild: [0, {}))",
+			index,
+			variants.len()
+		    ))),
+		    Some(s) => {
+			let next_schema = self.schema.step(s);
+			match SchemaKind::from(next_schema.inner) {
+			    $($kind)|* => AvroSerdeDeserializer {
+				schema: next_schema,
+				buf: self.buf
+			    }.deserialize_any(visitor),
+			    sk => Err(AvroDeError::custom(format!(
+				"Unexpected kind in union: {:?}",
+				sk
+			    ))),
+			}
+		    }
+		}
+	    } else {
+		self.deserialize_any(visitor)
+	    }
+	}
+	  )*
+    };
 }
 
 use std::io::Read;
 
-// XXX - Dupe of decode.rs and util.rs
-// #[inline]
-// pub fn decode_float<R: Read>(reader: &mut R) -> Result<f32, AvroDeError> {
-//     let mut buf = [0u8; 4];
-//     reader.read_exact(&mut buf[..])?;
-//     Ok(f32::from_le_bytes(buf))
-// }
-
-// #[inline]
-// pub fn decode_double<R: Read>(reader: &mut R) -> Result<f64, AvroDeError> {
-//     let mut buf = [0u8; 8];
-//     reader.read_exact(&mut buf[..])?;
-//     Ok(f64::from_le_bytes(buf))
-// }
-
-// fn decode_variable<R: Read>(reader: &mut R) -> Result<u64, AvroDeError> {
-//     let mut i = 0u64;
-//     let mut buf = [0u8; 1];
-
-//     let mut j = 0;
-//     loop {
-//         if j > 9 {
-//             // if j * 7 > 64
-//             return Err(AvroDeError::custom("Int decode overflow"));
-//         }
-//         reader.read_exact(&mut buf[..])?;
-//         i |= (u64::from(buf[0] & 0x7F)) << (j * 7);
-//         if (buf[0] >> 7) == 0 {
-//             break;
-//         } else {
-//             j += 1;
-//         }
-//     }
-
-//     Ok(i)
-// }
-
-// pub fn zag_i32<R: Read>(reader: &mut R) -> Result<i32, AvroDeError> {
-//     let i = zag_i64(reader)?;
-//     if i < i64::from(i32::min_value()) || i > i64::from(i32::max_value()) {
-//         Err(AvroDeError::custom(format!("i32 out of range: {}", i)))
-//     } else {
-//         Ok(i as i32)
-//     }
-// }
-
-// pub fn zag_i64<R: Read>(reader: &mut R) -> Result<i64, AvroDeError> {
-//     let z = decode_variable(reader)?;
-//     Ok(if z & 0x1 == 0 {
-//         (z >> 1) as i64
-//     } else {
-//         !(z >> 1) as i64
-//     })
-// }
-
-impl<'a, 'de, R> Deserializer<'de> for AvroSerdeDeserializer<'a, R>
-where
-    R: AvroRead,
+impl<'a, 'de> Deserializer<'de> for AvroSerdeDeserializer<'a>
 {
     type Error = AvroDeError;
 
@@ -1476,7 +1455,7 @@ where
             SchemaPiece::Null => v.visit_none(),
             SchemaPiece::Boolean => {
                 let mut buf = [0u8; 1];
-                let () = self.r.read_exact(&mut buf[..])?;
+                let () = self.buf.read_exact(&mut buf[..])?;
                 let val = match buf[0] {
                     0 => false,
                     1 => true,
@@ -1490,19 +1469,19 @@ where
                 v.visit_bool(val)
             }
             SchemaPiece::Int => {
-                let val = zag_i32(&mut self.r)?;
+                let val = zag_i32(&mut self.buf)?;
                 v.visit_i32(val)
             }
             SchemaPiece::Long => {
-                let val = zag_i64(&mut self.r)?;
+                let val = zag_i64(&mut self.buf)?;
                 v.visit_i64(val)
             }
             SchemaPiece::Float => {
-                let val = decode_float(&mut self.r)?;
+                let val = decode_float(&mut self.buf)?;
                 v.visit_f32(val)
             }
             SchemaPiece::Double => {
-                let val = decode_double(&mut self.r)?;
+                let val = decode_double(&mut self.buf)?;
                 v.visit_f64(val)
             }
             SchemaPiece::Date => {
@@ -1512,7 +1491,7 @@ where
                 // We should create a wrapper around NaiveDate that lets you deserialize
                 // from an int, and use that representation if we got here from
                 // deserialize_i32.
-                let days = zag_i32(&mut self.r)?;
+                let days = zag_i32(&mut self.buf)?;
                 let date = NaiveDate::from_ymd(1970, 1, 1)
                     .checked_add_signed(chrono::Duration::days(days.into()))
                     .ok_or_else(|| {
@@ -1594,14 +1573,14 @@ where
         V: Visitor<'de>,
     {
         if let SchemaPiece::Union(inner) = self.schema.inner {
-            let index = decode_long_nonneg(&mut self.r)? as usize;
+            let index = decode_long_nonneg(&mut self.buf)? as usize;
             let variants = inner.variants();
             match variants.get(index) {
                 Some(variant) => {
                     let next_schema = self.schema.step(variant);
                     let next = AvroSerdeDeserializer {
                         schema: next_schema,
-                        r: self.r,
+                        buf: self.buf,
                     };
                     next.deserialize_struct(name, fields, visitor)
                 }
@@ -1632,42 +1611,21 @@ where
         }
     }
 
-    fn deserialize_str<V>(mut self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        if let SchemaPiece::Union(inner) = self.schema.inner {
-            let index = decode_long_nonneg(&mut self.r)? as usize;
-            let variants = inner.variants();
-            match variants.get(index) {
-                None => Err(AvroDeError::custom(format!(
-                    "Bad union index: {} (valid: [0, {}))",
-                    index,
-                    variants.len()
-                ))),
-                Some(s) => {
-                    let next_schema = self.schema.step(s);
-                    match SchemaKind::from(next_schema.inner) {
-                        SchemaKind::String => AvroSerdeDeserializer {
-                            schema: next_schema,
-                            r: self.r,
-                        }
-                        .deserialize_any(visitor),
-                        sk => Err(AvroDeError::custom(format!(
-                            "Unexpected kind in union: {:?}",
-                            sk
-                        ))),
-                    }
-                }
-            }
-        } else {
-            self.deserialize_any(visitor)
-        }
+    check_union! {
+        (deserialize_str, SchemaKind::String),
+        (deserialize_i128, SchemaKind::Long, SchemaKind::Int),
+        (deserialize_i64, SchemaKind::Long, SchemaKind::Int),
+        (deserialize_i32, SchemaKind::Int),
+        (deserialize_f64, SchemaKind::Double, SchemaKind::Float),
+        (deserialize_f32, SchemaKind::Float),
+        (deserialize_bytes, SchemaKind::Bytes),
+        (deserialize_byte_buf, SchemaKind::Bytes),
+        (deserialize_string, SchemaKind::String),
     }
 
     forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        bool i8 i16 u8 u16 u32 u64 u128 char
+        option unit unit_struct newtype_struct seq tuple
         tuple_struct map enum identifier ignored_any
     }
 }
