@@ -17,6 +17,7 @@ use chrono::NaiveDate;
 use serde::de::Error;
 use serde::de::IntoDeserializer;
 use serde::de::MapAccess;
+use serde::de::SeqAccess;
 use serde::de::Unexpected;
 use serde::de::Visitor;
 use serde::forward_to_deserialize_any;
@@ -113,7 +114,7 @@ macro_rules! check_union {
 
 fn read_lengthed<'de, 'a>(buf: &'a mut &'de [u8]) -> Result<&'de [u8], AvroDeError> {
     let len = decode_len(buf)?;
-    if buf.len() <= len {
+    if len <= buf.len() {
         let (this_field, remaining) = buf.split_at(len);
         *buf = remaining;
         Ok(this_field)
@@ -225,7 +226,58 @@ impl<'de, 'a> Deserializer<'de> for AvroSerdeDeserializer<'de, 'a> {
             }
             SchemaPiece::Json => todo!(),
             SchemaPiece::Uuid => todo!(),
-            SchemaPiece::Array(_) => todo!(),
+            SchemaPiece::Array(inner) => {
+                struct ArrayDeserializer<'de, 'a> {
+                    schema: SchemaNode<'de>,
+                    buf: &'a mut &'de [u8],
+                    done: bool,
+                    remaining: usize,
+                }
+                impl<'de, 'a> SeqAccess<'de> for ArrayDeserializer<'de, 'a> {
+                    type Error = AvroDeError;
+
+                    fn next_element_seed<T>(
+                        &mut self,
+                        seed: T,
+                    ) -> Result<Option<T::Value>, Self::Error>
+                    where
+                        T: serde::de::DeserializeSeed<'de>,
+                    {
+                        if self.done {
+                            Ok(None)
+                        } else {
+                            if self.remaining == 0 {
+                                // TODO -- we can use len_in_bytes to quickly skip non-demanded arrays
+                                let (len, _len_in_bytes) = match zag_i64(self.buf)? {
+                                    len if len > 0 => (len as usize, None),
+                                    neglen if neglen < 0 => {
+                                        (neglen.abs() as usize, Some(decode_len(self.buf)?))
+                                    }
+                                    0 => {
+                                        self.done = true;
+                                        return Ok(None);
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                self.remaining = len;
+                            }
+                            assert!(self.remaining > 0);
+                            self.remaining -= 1;
+                            let answer = seed.deserialize(AvroSerdeDeserializer {
+                                schema: self.schema,
+                                buf: self.buf,
+                            })?;
+                            Ok(Some(answer))
+                        }
+                    }
+                }
+                v.visit_seq(ArrayDeserializer {
+                    schema: self.schema.step(&*inner),
+                    buf: self.buf,
+                    done: false,
+                    remaining: 0,
+                })
+            }
             SchemaPiece::Map(_) => todo!(),
             SchemaPiece::Union(_) => todo!(),
             SchemaPiece::ResolveIntTsMilli => todo!(),
@@ -251,17 +303,17 @@ impl<'de, 'a> Deserializer<'de> for AvroSerdeDeserializer<'de, 'a> {
             SchemaPiece::ResolveUnionConcrete { index, inner } => todo!(),
             SchemaPiece::Record { fields, .. } => {
                 // TODO - skip undemanded fields
-                struct StructDeserializer<'a, 'b> {
-                    schema: SchemaNode<'a>,
-                    fields: &'a [RecordField],
-                    buf: &'b mut &'a [u8],
+                struct StructDeserializer<'de, 'a> {
+                    schema: SchemaNode<'de>,
+                    fields: &'de [RecordField],
+                    buf: &'a mut &'de [u8],
                 }
-                impl<'a, 'b> MapAccess<'a> for StructDeserializer<'a, 'b> {
+                impl<'de, 'a> MapAccess<'de> for StructDeserializer<'de, 'a> {
                     type Error = AvroDeError;
 
                     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
                     where
-                        K: serde::de::DeserializeSeed<'a>,
+                        K: serde::de::DeserializeSeed<'de>,
                     {
                         let answer = match self.fields.first() {
                             Some(field) => Some(seed.deserialize(<&str as IntoDeserializer<
@@ -276,7 +328,7 @@ impl<'de, 'a> Deserializer<'de> for AvroSerdeDeserializer<'de, 'a> {
 
                     fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
                     where
-                        V: serde::de::DeserializeSeed<'a>,
+                        V: serde::de::DeserializeSeed<'de>,
                     {
                         // Intentionally panic here if fields is empty,
                         // because it means the visitor is calling things in the wrong
@@ -363,5 +415,103 @@ impl<'de, 'a> Deserializer<'de> for AvroSerdeDeserializer<'de, 'a> {
         bool i8 i16 u8 u16 u32 u64 u128 char
         option unit unit_struct newtype_struct seq tuple
         tuple_struct map enum identifier ignored_any
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDate;
+    use serde::Deserialize;
+
+    use crate::{serde::AvroSerdeDeserializer, types::Value, Schema};
+    use std::str::FromStr;
+
+    #[test]
+    fn test_basic_struct() {
+        #[derive(Deserialize, Debug)]
+        struct Inner {
+            date: NaiveDate,
+            int: i32,
+            long: i64,
+        }
+        #[derive(Deserialize, Debug)]
+        struct Outer<'a> {
+            inners: Vec<Inner>,
+            s: &'a str,
+            inner2: Inner,
+        }
+        let schema = r#"
+{
+    "type": "record",
+    "name": "Outer",
+    "fields": [{"type": {"type": "array", "items": {
+        "type": "record",
+        "name": "Inner",
+        "fields": [{"type": {"type": "int", "logicalType": "date"}, "name": "date"},
+            {"type": ["int", "string"], "name": "int"},
+            {"type": "long", "name": "long"}]
+        }}, "name": "inners"},
+        {"type": "string", "name": "s"},
+        {"type": "Inner", "name": "inner2"}]
+}"#;
+        let schema = Schema::from_str(&schema).unwrap();
+
+        let val = Value::Record(vec![
+            (
+                "inners".into(),
+                Value::Array(vec![
+                    Value::Record(vec![
+                        ("date".into(), Value::Int(18500)),
+                        (
+                            "int".into(),
+                            Value::Union {
+                                index: 0,
+                                inner: Box::new(Value::Int(42)),
+                                n_variants: 2,
+                                null_variant: None,
+                            },
+                        ),
+                        ("long".into(), Value::Long(9001)),
+                    ]),
+                    Value::Record(vec![
+                        ("date".into(), Value::Int(17000)),
+                        (
+                            "int".into(),
+                            Value::Union {
+                                index: 0,
+                                inner: Box::new(Value::Int(43)),
+                                n_variants: 2,
+                                null_variant: None,
+                            },
+                        ),
+                        ("long".into(), Value::Long(9002)),
+                    ]),
+                ]),
+            ),
+            ("s".into(), Value::String("Hello, world!".into())),
+            (
+                "inner2".into(),
+                Value::Record(vec![
+                    ("date".into(), Value::Int(16000)),
+                    (
+                        "int".into(),
+                        Value::Union {
+                            index: 0,
+                            inner: Box::new(Value::Int(44)),
+                            n_variants: 2,
+                            null_variant: None,
+                        },
+                    ),
+                    ("long".into(), Value::Long(9003)),
+                ]),
+            ),
+        ]);
+        let encoded = crate::encode::encode_to_vec(&val, &schema);
+        let deser = AvroSerdeDeserializer {
+            schema: schema.top_node(),
+            buf: &mut encoded.as_slice(),
+        };
+        let answer = Outer::deserialize(deser).unwrap();
+        eprintln!("{:#?}", answer);
     }
 }
