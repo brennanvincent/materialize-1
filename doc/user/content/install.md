@@ -10,7 +10,7 @@ Want to connect with Materialize? Join our growing community on Slack! →
 {{< /cta >}}
 
 You can access Materialize through the `materialized` binary, which you can
-install on macOS and Linux, or [build](#build-from-source) on most OSes (e.g. FreeBSD). These
+install or [build](#build-from-source) on macOS or Linux. Building on other OSes may be possible, but is unsupported. These
 instructions install the latest release of Materialize, **{{< version >}}**. The latest (unstable)
 developer builds are available at https://dev.materialize.com/. For prior releases,
 see the [Versions page](/versions).
