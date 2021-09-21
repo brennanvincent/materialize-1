@@ -90,6 +90,8 @@ def launch_mz() -> None:
             "--cidfile",
             "docker.cid",
             image.spec(),
+            "-w",
+            "1",
         ],
         stdout=stdout,
         stderr=stderr,
@@ -182,7 +184,7 @@ def main() -> None:
     cur = conn.cursor()
     print("Rss,Vms,User Cpu,System Cpu,Wall Time")
     cur.execute(
-        "CREATE SOURCE s FROM KAFKA BROKER 'confluent:9093' TOPIC 'bench_data' FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://confluent:8081'"
+        "CREATE SOURCE s FROM KAFKA BROKER 'confluent:9093' TOPIC 'bench_data' FORMAT BYTES"
     )
     prev = PrevStats(time.time(), 0.0, 0.0)
     for _ in range(ns.trials):
