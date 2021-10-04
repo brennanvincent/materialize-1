@@ -130,21 +130,26 @@ fn read_lengthed<'de, 'a>(buf: &'a mut &'de [u8]) -> Result<&'de [u8], AvroDeErr
 impl<'de, 'a> AvroSerdeDeserializer<'de, 'a> {
     fn try_step_union(&mut self) -> Result<bool, AvroDeError> {
         if let SchemaPiece::Union(inner) = self.schema.inner {
-            let index = decode_long_nonneg(self.buf)? as usize;
-            let variants = inner.variants();
-            match variants.get(index) {
-                Some(variant) => {
-                    self.schema = self.schema.step(variant);
-                    Ok(true)
-                }
-                None => Err(AvroDeError::custom(format!(
-                    "Bad union index: {} (valid: [0, {}))",
-                    index,
-                    variants.len()
-                ))),
-            }
+            self.schema = Self::step_union(self.buf, inner, self.schema)?;
+            Ok(true)
         } else {
             Ok(false)
+        }
+    }
+    fn step_union(
+        buf: &mut &'de [u8],
+        inner: &'de UnionSchema,
+        schema: SchemaNode<'de>,
+    ) -> Result<SchemaNode<'de>, AvroDeError> {
+        let index = decode_long_nonneg(buf)? as usize;
+        let variants = inner.variants();
+        match variants.get(index) {
+            Some(variant) => Ok(schema.step(variant)),
+            None => Err(AvroDeError::custom(format!(
+                "Bad union index: {} (valid: [0, {}))",
+                index,
+                variants.len()
+            ))),
         }
     }
 }
@@ -279,7 +284,26 @@ impl<'de, 'a> Deserializer<'de> for AvroSerdeDeserializer<'de, 'a> {
                 })
             }
             SchemaPiece::Map(_) => todo!(),
-            SchemaPiece::Union(_) => todo!(),
+            SchemaPiece::Union(us) => {
+		let mut b = *self.buf;
+                let next_schema = Self::step_union(&mut b, us, self.schema)?;
+                if let Some(name) = next_schema.name {
+                    // We should have gotten here via one of the other methods
+                    // which tell the deserializer the name it's decoding.
+                    //
+                    // Decoding a named type into something that
+                    // doesn't provide its name is probably a mistake.
+
+                    Err(AvroDeError::custom(format!("Named union type {:?} in unnamed context", name)))
+                } else {
+                    let next = AvroSerdeDeserializer {
+                        schema: next_schema,
+                        buf: self.buf,
+                    };
+		    next.deserialize_any(v)
+                }
+            }
+
             SchemaPiece::ResolveIntTsMilli => todo!(),
             SchemaPiece::ResolveIntTsMicro => todo!(),
             SchemaPiece::ResolveDateTimestamp => todo!(),
@@ -420,6 +444,7 @@ impl<'de, 'a> Deserializer<'de> for AvroSerdeDeserializer<'de, 'a> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Duration;
     use chrono::NaiveDate;
     use serde::Deserialize;
 
@@ -428,13 +453,13 @@ mod tests {
 
     #[test]
     fn test_basic_struct() {
-        #[derive(Deserialize, Debug)]
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
         struct Inner {
             date: NaiveDate,
             int: i32,
             long: i64,
         }
-        #[derive(Deserialize, Debug)]
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
         struct Outer<'a> {
             inners: Vec<Inner>,
             s: &'a str,
@@ -456,6 +481,26 @@ mod tests {
 }"#;
         let schema = Schema::from_str(&schema).unwrap();
 
+        let expected = Outer {
+            inners: vec![
+                Inner {
+                    date: NaiveDate::from_ymd(1970, 1, 1) + Duration::days(18500),
+                    int: 42,
+                    long: 9001,
+                },
+                Inner {
+                    date: NaiveDate::from_ymd(1970, 1, 1) + Duration::days(17000),
+                    int: 43,
+                    long: 9002,
+                },
+            ],
+            s: "Hello, world!",
+            inner2: Inner {
+                date: NaiveDate::from_ymd(1970, 1, 1) + Duration::days(16000),
+                int: 44,
+                long: 9003,
+            },
+        };
         let val = Value::Record(vec![
             (
                 "inners".into(),
@@ -512,6 +557,6 @@ mod tests {
             buf: &mut encoded.as_slice(),
         };
         let answer = Outer::deserialize(deser).unwrap();
-        eprintln!("{:#?}", answer);
+        assert!(answer == expected)
     }
 }
