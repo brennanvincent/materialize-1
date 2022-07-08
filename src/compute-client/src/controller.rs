@@ -29,6 +29,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use differential_dataflow::lattice::Lattice;
 use mz_persist_types::Codec64;
+use mz_storage::client::StorageResponse;
 use timely::progress::frontier::MutableAntichain;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
 use uuid::Uuid;
@@ -70,7 +71,8 @@ pub struct ComputeControllerState<T> {
 pub struct ComputeController<'a, T> {
     pub instance: ComputeInstanceId,
     pub compute: &'a ComputeControllerState<T>,
-    pub storage_controller: &'a dyn StorageController<Timestamp = T>,
+    pub storage_controller:
+        &'a dyn StorageController<Timestamp = T, Token = Option<StorageResponse<T>>>,
 }
 
 /// A mutable controller for a compute instance.
@@ -78,7 +80,8 @@ pub struct ComputeController<'a, T> {
 pub struct ComputeControllerMut<'a, T> {
     pub instance: ComputeInstanceId,
     pub compute: &'a mut ComputeControllerState<T>,
-    pub storage_controller: &'a mut dyn StorageController<Timestamp = T>,
+    pub storage_controller:
+        &'a mut dyn StorageController<Timestamp = T, Token = Option<StorageResponse<T>>>,
 }
 
 /// Responses from a compute instance controller.
@@ -223,7 +226,9 @@ where
 
     /// Acquires an immutable handle to a controller for the storage instance.
     #[inline]
-    pub fn storage(&self) -> &dyn StorageController<Timestamp = T> {
+    pub fn storage(
+        &self,
+    ) -> &dyn StorageController<Timestamp = T, Token = Option<StorageResponse<T>>> {
         self.storage_controller
     }
 
@@ -251,7 +256,9 @@ where
 
     /// Acquires a mutable handle to a controller for the storage instance.
     #[inline]
-    pub fn storage_mut(&mut self) -> &mut dyn StorageController<Timestamp = T> {
+    pub fn storage_mut(
+        &mut self,
+    ) -> &mut dyn StorageController<Timestamp = T, Token = Option<StorageResponse<T>>> {
         self.storage_controller
     }
 

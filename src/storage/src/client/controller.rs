@@ -32,6 +32,7 @@ use differential_dataflow::lattice::Lattice;
 use futures::future;
 use futures::stream::TryStreamExt as _;
 use futures::stream::{FuturesUnordered, StreamExt};
+use mz_service::ready::ReadyProcess;
 use proptest_derive::Arbitrary;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -83,7 +84,9 @@ pub struct CollectionDescription {
 }
 
 #[async_trait(?Send)]
-pub trait StorageController: Debug + Send {
+pub trait StorageController:
+    Debug + Send + ReadyProcess<Token = Option<StorageResponse<Self::Timestamp>>, Response = ()>
+{
     type Timestamp;
 
     /// Acquire an immutable reference to the collection state, should it exist.
@@ -150,25 +153,6 @@ pub trait StorageController: Debug + Send {
         &mut self,
         updates: &mut BTreeMap<GlobalId, ChangeBatch<Self::Timestamp>>,
     ) -> Result<(), StorageError>;
-
-    /// Waits until the controller is ready to process a response.
-    ///
-    /// This method may block for an arbitrarily long time.
-    ///
-    /// When the method returns, the owner should call
-    /// [`StorageController::process`] to process the ready message.
-    ///
-    /// This method is cancellation safe.
-    async fn ready(&mut self);
-
-    /// Processes the work queued by [`StorageController::ready`].
-    ///
-    /// This method is guaranteed to return "quickly" unless doing so would
-    /// compromise the correctness of the system.
-    ///
-    /// This method is **not** guaranteed to be cancellation safe. It **must**
-    /// be awaited to completion.
-    async fn process(&mut self) -> Result<(), anyhow::Error>;
 }
 
 /// Compaction policies for collections maintained by `Controller`.
@@ -304,7 +288,6 @@ pub struct StorageControllerState<
     pub(super) collections: BTreeMap<GlobalId, CollectionState<T>>,
     pub(super) stash: S,
     pub(super) persist_handles: BTreeMap<GlobalId, PersistHandles<T>>,
-    stashed_response: Option<StorageResponse<T>>,
 }
 
 /// A storage controller for a storage instance.
@@ -419,7 +402,46 @@ impl<T: Timestamp + Lattice + Codec64> StorageControllerState<T> {
             collections: BTreeMap::default(),
             stash,
             persist_handles: BTreeMap::default(),
-            stashed_response: None,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl<T> ReadyProcess for Controller<T>
+where
+    T: Timestamp + Lattice + TotalOrder + TryInto<i64> + TryFrom<i64> + Codec64 + Unpin,
+    <T as TryInto<i64>>::Error: std::fmt::Debug,
+    <T as TryFrom<i64>>::Error: std::fmt::Debug,
+    StorageCommand<T>: RustType<ProtoStorageCommand>,
+    StorageResponse<T>: RustType<ProtoStorageResponse>,
+{
+    type Token = Option<StorageResponse<T>>;
+    type Response = ();
+
+    async fn ready(&mut self) -> Option<StorageResponse<T>> {
+        let mut clients = self
+            .hosts
+            .clients()
+            .map(|client| client.response_stream())
+            .enumerate()
+            .collect::<StreamMap<_, _>>();
+        if clients.is_empty() {
+            // If there are no clients, block forever. This signals that there
+            // may be more work to do (e.g., if this future is dropped and
+            // `create_collections` is called). Awaiting the stream map would
+            // return `None`, which would incorrectly indicate the completion
+            // of the stream.
+            return future::pending().await;
+        }
+        clients.next().await.map(|(_id, res)| res)
+    }
+    async fn process(&mut self, token: Option<StorageResponse<T>>) -> Result<(), anyhow::Error> {
+        match token {
+            None => Ok(()),
+            Some(StorageResponse::FrontierUppers(updates)) => {
+                self.update_write_frontiers(&updates).await?;
+                Ok(())
+            }
         }
     }
 }
@@ -810,34 +832,6 @@ where
         }
 
         Ok(())
-    }
-
-    async fn ready(&mut self) {
-        let mut clients = self
-            .hosts
-            .clients()
-            .map(|client| client.response_stream())
-            .enumerate()
-            .collect::<StreamMap<_, _>>();
-        if clients.is_empty() {
-            // If there are no clients, block forever. This signals that there
-            // may be more work to do (e.g., if this future is dropped and
-            // `create_collections` is called). Awaiting the stream map would
-            // return `None`, which would incorrectly indicate the completion
-            // of the stream.
-            return future::pending().await;
-        }
-        self.state.stashed_response = clients.next().await.map(|(_id, res)| res)
-    }
-
-    async fn process(&mut self) -> Result<(), anyhow::Error> {
-        match self.state.stashed_response.take() {
-            None => Ok(()),
-            Some(StorageResponse::FrontierUppers(updates)) => {
-                self.update_write_frontiers(&updates).await?;
-                Ok(())
-            }
-        }
     }
 }
 

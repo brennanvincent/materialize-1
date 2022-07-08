@@ -241,15 +241,19 @@ impl<T> From<ComputeControllerResponse<T>> for ControllerResponse<T> {
 
 /// Whether one of the underlying controllers is ready for their `process`
 /// method to be called.
-#[derive(Default)]
-enum Readiness {
+enum Readiness<T> {
     /// No underlying controllers are ready.
-    #[default]
     NotReady,
     /// The storage controller is ready.
-    Storage,
+    Storage(Option<StorageResponse<T>>),
     /// The compute controller is ready.
     Compute(ComputeInstanceId),
+}
+
+impl<T> Default for Readiness<T> {
+    fn default() -> Self {
+        Self::NotReady
+    }
 }
 
 /// A client that maintains soft state and validates commands, in addition to forwarding them.
@@ -258,11 +262,12 @@ enum Readiness {
 /// referred to as the `dataflow_client` in the coordinator to be very
 /// confusing. We should find the one correct name, and use it everywhere!
 pub struct Controller<T = mz_repr::Timestamp> {
-    storage_controller: Box<dyn StorageController<Timestamp = T>>,
+    storage_controller:
+        Box<dyn StorageController<Timestamp = T, Token = Option<StorageResponse<T>>>>,
     compute_orchestrator: Arc<dyn NamespacedOrchestrator>,
     computed_image: String,
     compute: BTreeMap<ComputeInstanceId, ComputeControllerState<T>>,
-    readiness: Readiness,
+    readiness: Readiness<T>,
 }
 
 impl<T> Controller<T>
@@ -459,13 +464,17 @@ where
 impl<T> Controller<T> {
     /// Acquires an immutable handle to a controller for the storage instance.
     #[inline]
-    pub fn storage(&self) -> &dyn StorageController<Timestamp = T> {
+    pub fn storage(
+        &self,
+    ) -> &dyn StorageController<Timestamp = T, Token = Option<StorageResponse<T>>> {
         &*self.storage_controller
     }
 
     /// Acquires a mutable handle to a controller for the storage instance.
     #[inline]
-    pub fn storage_mut(&mut self) -> &mut dyn StorageController<Timestamp = T> {
+    pub fn storage_mut(
+        &mut self,
+    ) -> &mut dyn StorageController<Timestamp = T, Token = Option<StorageResponse<T>>> {
         &mut *self.storage_controller
     }
 
@@ -517,8 +526,8 @@ where
                 (id, _index, _remaining) = computes => {
                     self.readiness = Readiness::Compute(id);
                 }
-                () = self.storage_controller.ready() => {
-                    self.readiness = Readiness::Storage;
+                token = self.storage_controller.ready() => {
+                    self.readiness = Readiness::Storage(token);
                 }
             }
         }
@@ -534,8 +543,8 @@ where
     pub async fn process(&mut self) -> Result<Option<ControllerResponse<T>>, anyhow::Error> {
         match mem::take(&mut self.readiness) {
             Readiness::NotReady => Ok(None),
-            Readiness::Storage => {
-                self.storage_mut().process().await?;
+            Readiness::Storage(token) => {
+                self.storage_mut().process(token).await?;
                 Ok(None)
             }
             Readiness::Compute(id) => {
