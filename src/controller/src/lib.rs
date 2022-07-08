@@ -22,16 +22,17 @@
 //! about each of these interfaces.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::mem;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use differential_dataflow::lattice::Lattice;
 use futures::future::{self, FutureExt};
 use futures::stream::{BoxStream, StreamExt};
 use maplit::hashmap;
+use mz_service::ready::ReadyProcess;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -241,19 +242,12 @@ impl<T> From<ComputeControllerResponse<T>> for ControllerResponse<T> {
 
 /// Whether one of the underlying controllers is ready for their `process`
 /// method to be called.
-enum Readiness<T> {
-    /// No underlying controllers are ready.
-    NotReady,
+#[derive(Debug)]
+pub enum Readiness<T> {
     /// The storage controller is ready.
     Storage(Option<StorageResponse<T>>),
     /// The compute controller is ready.
     Compute(ComputeInstanceId),
-}
-
-impl<T> Default for Readiness<T> {
-    fn default() -> Self {
-        Self::NotReady
-    }
 }
 
 /// A client that maintains soft state and validates commands, in addition to forwarding them.
@@ -267,7 +261,6 @@ pub struct Controller<T = mz_repr::Timestamp> {
     compute_orchestrator: Arc<dyn NamespacedOrchestrator>,
     computed_image: String,
     compute: BTreeMap<ComputeInstanceId, ComputeControllerState<T>>,
-    readiness: Readiness<T>,
 }
 
 impl<T> Controller<T>
@@ -501,48 +494,36 @@ impl<T> Controller<T> {
     }
 }
 
-impl<T> Controller<T>
+#[async_trait(?Send)]
+impl<T> ReadyProcess for Controller<T>
 where
     T: Timestamp + Lattice + Codec64,
 {
-    /// Waits until the controller is ready to process a response.
-    ///
-    /// This method may block for an arbitrarily long time.
-    ///
-    /// When the method returns, the owner should call [`Controller::ready`] to
-    /// process the ready message.
-    ///
-    /// This method is cancellation safe.
-    pub async fn ready(&mut self) {
-        if let Readiness::NotReady = self.readiness {
-            // The underlying `ready` methods are cancellation safe, so it is
-            // safe to construct this `select!`.
-            let computes = future::select_all(
-                self.compute
-                    .iter_mut()
-                    .map(|(id, compute)| Box::pin(compute.ready().map(|()| *id))),
-            );
-            tokio::select! {
-                (id, _index, _remaining) = computes => {
-                    self.readiness = Readiness::Compute(id);
-                }
-                token = self.storage_controller.ready() => {
-                    self.readiness = Readiness::Storage(token);
-                }
+    type Token = Readiness<T>;
+    type Response = Option<ControllerResponse<T>>;
+
+    async fn ready(&mut self) -> Readiness<T> {
+        // The underlying `ready` methods are cancellation safe, so it is
+        // safe to construct this `select!`.
+        let computes = future::select_all(
+            self.compute
+                .iter_mut()
+                .map(|(id, compute)| Box::pin(compute.ready().map(|()| *id))),
+        );
+        tokio::select! {
+            (id, _index, _remaining) = computes => {
+                Readiness::Compute(id)
+            }
+            token = self.storage_controller.ready() => {
+                Readiness::Storage(token)
             }
         }
     }
-
-    /// Processes the work queued by [`Controller::ready`].
-    ///
-    /// This method is guaranteed to return "quickly" unless doing so would
-    /// compromise the correctness of the system.
-    ///
-    /// This method is **not** guaranteed to be cancellation safe. It **must**
-    /// be awaited to completion.
-    pub async fn process(&mut self) -> Result<Option<ControllerResponse<T>>, anyhow::Error> {
-        match mem::take(&mut self.readiness) {
-            Readiness::NotReady => Ok(None),
+    async fn process(
+        &mut self,
+        token: Readiness<T>,
+    ) -> Result<Option<ControllerResponse<T>>, anyhow::Error> {
+        match token {
             Readiness::Storage(token) => {
                 self.storage_mut().process(token).await?;
                 Ok(None)
@@ -582,7 +563,6 @@ where
             compute_orchestrator: config.orchestrator.namespace("compute"),
             computed_image: config.computed_image,
             compute: BTreeMap::default(),
-            readiness: Readiness::NotReady,
         }
     }
 }

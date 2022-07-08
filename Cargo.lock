@@ -2937,6 +2937,7 @@ dependencies = [
  "mz-proto",
  "mz-repr",
  "mz-secrets",
+ "mz-service",
  "mz-sql",
  "mz-sql-parser",
  "mz-stash",
@@ -3137,6 +3138,7 @@ name = "mz-controller"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "differential-dataflow",
  "futures",

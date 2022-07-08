@@ -103,7 +103,7 @@ use mz_compute_client::explain::{
 use mz_compute_client::response::PeekResponse;
 use mz_controller::{
     ClusterReplicaSizeConfig, ClusterReplicaSizeMap, ComputeInstanceEvent,
-    ConcreteComputeInstanceReplicaConfig, ControllerResponse,
+    ConcreteComputeInstanceReplicaConfig, ControllerResponse, Readiness,
 };
 use mz_expr::{
     permutation_for_arrangement, CollectionPlan, ExprHumanizer, MirRelationExpr, MirScalarExpr,
@@ -120,6 +120,7 @@ use mz_repr::{
     Datum, Diff, GlobalId, RelationDesc, RelationType, Row, RowArena, ScalarType, Timestamp,
 };
 use mz_secrets::{SecretOp, SecretsController};
+use mz_service::ready::ReadyProcess;
 use mz_sql::ast::display::AstDisplay;
 use mz_sql::ast::{
     CreateIndexStatement, CreateSourceStatement, ExplainStageNew, ExplainStageOld, FetchStatement,
@@ -182,7 +183,7 @@ mod indexes;
 #[derive(Debug)]
 pub enum Message<T = mz_repr::Timestamp> {
     Command(Command),
-    ControllerReady,
+    ControllerReady(Readiness<T>),
     CreateSourceStatementReady(CreateSourceStatementReady),
     SinkConnectionReady(SinkConnectionReady),
     SendDiffs(SendDiffs),
@@ -1049,8 +1050,8 @@ impl<S: Append + 'static> Coordinator<S> {
                 _ = advance_local_inputs_interval.tick() => Message::AdvanceLocalInputs,
                 // See [`mz_controller::Controller::Controller::ready`] for notes
                 // on why this is cancel-safe.
-                () = self.dataflow_client.ready() => {
-                    Message::ControllerReady
+                token = self.dataflow_client.ready() => {
+                    Message::ControllerReady(token)
                 }
                 // `recv()` on `UnboundedReceiver` is cancellation safe:
                 // https://docs.rs/tokio/1.8.0/tokio/sync/mpsc/struct.UnboundedReceiver.html#cancel-safety
@@ -1074,8 +1075,8 @@ impl<S: Append + 'static> Coordinator<S> {
 
             match msg {
                 Message::Command(cmd) => self.message_command(cmd).await,
-                Message::ControllerReady => {
-                    if let Some(m) = self.dataflow_client.process().await.unwrap() {
+                Message::ControllerReady(token) => {
+                    if let Some(m) = self.dataflow_client.process(token).await.unwrap() {
                         self.message_controller(m).await
                     }
                 }
