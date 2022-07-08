@@ -32,6 +32,7 @@ use differential_dataflow::lattice::Lattice;
 use futures::future::{self, FutureExt};
 use futures::stream::{BoxStream, StreamExt};
 use maplit::hashmap;
+use mz_compute_client::ActiveReplicationResponse;
 use mz_service::ready::ReadyProcess;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -247,7 +248,7 @@ pub enum Readiness<T> {
     /// The storage controller is ready.
     Storage(Option<StorageResponse<T>>),
     /// The compute controller is ready.
-    Compute(ComputeInstanceId),
+    Compute(Option<ActiveReplicationResponse<T>>, ComputeInstanceId),
 }
 
 /// A client that maintains soft state and validates commands, in addition to forwarding them.
@@ -503,16 +504,19 @@ where
     type Response = Option<ControllerResponse<T>>;
 
     async fn ready(&mut self) -> Readiness<T> {
+        let compute_ids = self.compute.keys().copied().collect::<Vec<_>>();
         // The underlying `ready` methods are cancellation safe, so it is
         // safe to construct this `select!`.
         let computes = future::select_all(
-            self.compute
-                .iter_mut()
-                .map(|(id, compute)| Box::pin(compute.ready().map(|()| *id))),
+            compute_ids.into_iter()
+                .map(|id| {
+                    let mut compute = self.compute_mut(id).unwrap();
+                    Box::pin(compute.ready().map(move |token| (token, id)))
+                }),
         );
         tokio::select! {
-            (id, _index, _remaining) = computes => {
-                Readiness::Compute(id)
+            ((token, id), _index, _remaining) = computes => {
+                Readiness::Compute(token, id)
             }
             token = self.storage_controller.ready() => {
                 Readiness::Storage(token)
@@ -528,11 +532,11 @@ where
                 self.storage_mut().process(token).await?;
                 Ok(None)
             }
-            Readiness::Compute(id) => {
+            Readiness::Compute(token, id) => {
                 let response = self
                     .compute_mut(id)
                     .expect("reference to absent compute instance")
-                    .process()
+                    .process(token)
                     .await?;
                 Ok(response.map(|r| r.into()))
             }

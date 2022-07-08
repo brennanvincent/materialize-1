@@ -20,3 +20,5 @@ pub mod logging;
 pub mod plan;
 pub mod response;
 pub mod service;
+
+pub use controller::ActiveReplicationResponse;

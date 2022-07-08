@@ -26,9 +26,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use differential_dataflow::lattice::Lattice;
 use mz_persist_types::Codec64;
+use mz_service::ready::ReadyProcess;
 use mz_storage::client::StorageResponse;
 use timely::progress::frontier::MutableAntichain;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
@@ -44,12 +46,14 @@ use mz_storage::client::sinks::{PersistSinkConnection, SinkConnection, SinkDesc}
 use crate::command::{
     ComputeCommand, DataflowDescription, InstanceConfig, Peek, ReplicaId, SourceInstanceDesc,
 };
-use crate::controller::replicated::{ActiveReplication, ActiveReplicationResponse};
+use crate::controller::replicated::{ActiveReplication};
 use crate::logging::LoggingConfig;
 use crate::response::{ComputeResponse, PeekResponse, TailBatch, TailResponse};
 use crate::service::ComputeClient;
 
 mod replicated;
+
+pub use replicated::ActiveReplicationResponse;
 
 /// An abstraction allowing us to name different compute instances.
 pub type ComputeInstanceId = u64;
@@ -198,20 +202,6 @@ where
             stashed_response: None,
         }
     }
-
-    /// Waits until the controller is ready to process a response.
-    ///
-    /// This method may block for an arbitrarily long time.
-    ///
-    /// When the method returns, the owner should call
-    /// [`ComputeControllerMut::process`] to process the ready message.
-    ///
-    /// This method is cancellation safe.
-    pub async fn ready(&mut self) {
-        if self.stashed_response.is_none() {
-            self.stashed_response = self.client.recv().await;
-        }
-    }
 }
 
 // Public interface
@@ -239,6 +229,58 @@ where
             .get(&id)
             .ok_or(ComputeError::IdentifierMissing(id))
     }
+}
+
+#[async_trait(?Send)]
+impl<'a, T> ReadyProcess for ComputeControllerMut<'a, T>
+where
+    T: Timestamp + Lattice + Codec64 {
+    type Token = Option<ActiveReplicationResponse<T>>;
+    type Response = Option<ComputeControllerResponse<T>>;
+    async fn ready(&mut self) -> Option<ActiveReplicationResponse<T>> {
+        self.compute.client.recv().await
+    }
+    async fn process(&mut self, token: Self::Token) -> Result<Option<ComputeControllerResponse<T>>, anyhow::Error> {
+        match token {
+            None => Ok(None),
+            Some(ActiveReplicationResponse::ComputeResponse(response)) => match response {
+                ComputeResponse::FrontierUppers(updates) => {
+                    self.update_write_frontiers(&updates).await?;
+                    Ok(None)
+                }
+                ComputeResponse::PeekResponse(uuid, peek_response, otel_ctx) => {
+                    self.remove_peeks(std::iter::once(uuid)).await?;
+                    Ok(Some(ComputeControllerResponse::PeekResponse(
+                        uuid,
+                        peek_response,
+                        otel_ctx,
+                    )))
+                }
+                ComputeResponse::TailResponse(global_id, response) => {
+                    let mut changes = timely::progress::ChangeBatch::new();
+                    match &response {
+                        TailResponse::Batch(TailBatch { lower, upper, .. }) => {
+                            changes.extend(upper.iter().map(|time| (time.clone(), 1)));
+                            changes.extend(lower.iter().map(|time| (time.clone(), -1)));
+                        }
+                        TailResponse::DroppedAt(frontier) => {
+                            // The tail will not be written to again, but we should not confuse that
+                            // with the source of the TAIL being complete through this time.
+                            changes.extend(frontier.iter().map(|time| (time.clone(), -1)));
+                        }
+                    }
+                    self.update_write_frontiers(&[(global_id, changes)]).await?;
+                    Ok(Some(ComputeControllerResponse::TailResponse(
+                        global_id, response,
+                    )))
+                }
+            },
+            Some(ActiveReplicationResponse::ReplicaHeartbeat(replica_id, when)) => Ok(Some(
+                ComputeControllerResponse::ReplicaHeartbeat(replica_id, when),
+            )),
+        }
+    }
+
 }
 
 impl<'a, T> ComputeControllerMut<'a, T>
@@ -583,54 +625,6 @@ where
                 .await?;
         }
         Ok(())
-    }
-
-    /// Processes the work queued by [`ComputeControllerState::ready`].
-    ///
-    /// This method is guaranteed to return "quickly" unless doing so would
-    /// compromise the correctness of the system.
-    ///
-    /// This method is **not** guaranteed to be cancellation safe. It **must**
-    /// be awaited to completion.
-    pub async fn process(&mut self) -> Result<Option<ComputeControllerResponse<T>>, anyhow::Error> {
-        match self.compute.stashed_response.take() {
-            None => Ok(None),
-            Some(ActiveReplicationResponse::ComputeResponse(response)) => match response {
-                ComputeResponse::FrontierUppers(updates) => {
-                    self.update_write_frontiers(&updates).await?;
-                    Ok(None)
-                }
-                ComputeResponse::PeekResponse(uuid, peek_response, otel_ctx) => {
-                    self.remove_peeks(std::iter::once(uuid)).await?;
-                    Ok(Some(ComputeControllerResponse::PeekResponse(
-                        uuid,
-                        peek_response,
-                        otel_ctx,
-                    )))
-                }
-                ComputeResponse::TailResponse(global_id, response) => {
-                    let mut changes = timely::progress::ChangeBatch::new();
-                    match &response {
-                        TailResponse::Batch(TailBatch { lower, upper, .. }) => {
-                            changes.extend(upper.iter().map(|time| (time.clone(), 1)));
-                            changes.extend(lower.iter().map(|time| (time.clone(), -1)));
-                        }
-                        TailResponse::DroppedAt(frontier) => {
-                            // The tail will not be written to again, but we should not confuse that
-                            // with the source of the TAIL being complete through this time.
-                            changes.extend(frontier.iter().map(|time| (time.clone(), -1)));
-                        }
-                    }
-                    self.update_write_frontiers(&[(global_id, changes)]).await?;
-                    Ok(Some(ComputeControllerResponse::TailResponse(
-                        global_id, response,
-                    )))
-                }
-            },
-            Some(ActiveReplicationResponse::ReplicaHeartbeat(replica_id, when)) => Ok(Some(
-                ComputeControllerResponse::ReplicaHeartbeat(replica_id, when),
-            )),
-        }
     }
 }
 
