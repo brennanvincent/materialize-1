@@ -337,6 +337,7 @@ mod writer;
 pub mod error;
 pub mod schema;
 pub mod types;
+pub mod serde;
 
 pub use crate::codec::Codec;
 pub use crate::decode::public_decoders::*;

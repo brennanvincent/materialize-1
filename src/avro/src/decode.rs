@@ -1251,19 +1251,23 @@ pub struct GeneralDeserializer<'a> {
     pub schema: SchemaNode<'a>,
 }
 
+pub(crate) fn decode_boolean<R: AvroRead>(r: &mut R) -> Result<bool, AvroError> {
+    let mut buf = [0u8; 1];
+    r.read_exact(&mut buf[..])?;
+    match buf[0] {
+        0u8 => Ok(false),
+        1u8 => Ok(true),
+        other => Err(AvroError::Decode(DecodeError::BadBoolean(other))),
+    }    
+}
+
 impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
     fn deserialize<R: AvroRead, D: AvroDecode>(self, r: &mut R, d: D) -> Result<D::Out, AvroError> {
         use ValueOrReader::Reader;
         match self.schema.inner {
             SchemaPiece::Null => d.scalar(Scalar::Null),
             SchemaPiece::Boolean => {
-                let mut buf = [0u8; 1];
-                r.read_exact(&mut buf[..])?;
-                let val = match buf[0] {
-                    0u8 => false,
-                    1u8 => true,
-                    other => return Err(AvroError::Decode(DecodeError::BadBoolean(other))),
-                };
+                let val = decode_boolean(r)?;
                 d.scalar(Scalar::Boolean(val))
             }
             SchemaPiece::Int => {
