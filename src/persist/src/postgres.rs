@@ -26,7 +26,7 @@ use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use postgres_openssl::MakeTlsConnector;
 use std::time::Instant;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::error::Error;
 use crate::location::{Consensus, ExternalError, SeqNo, VersionedData};
@@ -355,12 +355,21 @@ impl Consensus for PostgresConsensus {
             "#;
             let client = self.get_connection().await?;
             let statement = client.prepare_cached(q).await?;
-            client
+            let result = client
                 .execute(
                     &statement,
                     &[&key, &new.seqno, &new.data.as_ref(), &expected],
                 )
-                .await?
+                .await;
+            info!(
+                "[btv] key: {} new seqno: {} new data len: {} expected: {} result: {}",
+                key,
+                new.seqno,
+                new.data.len(),
+                expected,
+                result.is_ok()
+            );
+            result?
         } else {
             // Insert the new row as long as no other row exists for the same shard.
             let q = "INSERT INTO consensus SELECT $1, $2, $3 WHERE

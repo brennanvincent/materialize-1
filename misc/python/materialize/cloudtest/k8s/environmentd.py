@@ -63,6 +63,7 @@ class EnvironmentdStatefulSet(K8sStatefulSet):
             V1EnvVar(name="AWS_REGION", value="minio"),
             V1EnvVar(name="AWS_ACCESS_KEY_ID", value="minio"),
             V1EnvVar(name="AWS_SECRET_ACCESS_KEY", value="minio123"),
+            V1EnvVar(name="MZ_LOG_FILTER", value="mz_service::grpc=trace,info"),
         ]
 
         ports = [V1ContainerPort(container_port=5432, name="sql")]

@@ -17,7 +17,7 @@ from materialize.cloudtest.application import MaterializeApplication
 # We would like to use large clusters here, e.g. SIZE=16, in order to get a pronounced
 # "thundering herd" effect when restarting, but due to https://github.com/MaterializeInc/materialize/issues/14689
 # clusters of sizes 8 and 16 can not be reliably started, let alone restarted.
-CLUSTER_SIZE = 4
+CLUSTER_SIZE = 16
 
 
 def populate(mz: MaterializeApplication, seed: int) -> None:

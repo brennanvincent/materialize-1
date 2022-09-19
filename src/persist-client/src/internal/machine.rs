@@ -227,15 +227,23 @@ where
 
             match res {
                 Ok(merge_reqs) => {
-                    let mut compact_reqs = Vec::with_capacity(merge_reqs.len());
-                    for req in merge_reqs {
-                        let req = CompactReq {
+                    let compact_reqs = merge_reqs
+                        .into_iter()
+                        .map(|req| CompactReq {
                             shard_id: self.shard_id(),
                             desc: req.desc,
                             inputs: req.inputs,
-                        };
-                        compact_reqs.push(req);
-                    }
+                        })
+                        .collect::<Vec<_>>();
+                    // let mut compact_reqs = Vec::with_capacity(merge_reqs.len());
+                    // for req in merge_reqs {
+                    //     let req = CompactReq {
+                    //         shard_id: self.shard_id(),
+                    //         desc: req.desc,
+                    //         inputs: req.inputs,
+                    //     };
+                    //     compact_reqs.push(req);
+                    // }
                     let writer_maintenance = WriterMaintenance {
                         routine,
                         compaction: compact_reqs,
