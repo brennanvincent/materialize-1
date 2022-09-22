@@ -368,7 +368,7 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
                     }),
                     env: Some(vec![EnvVar {
                         name: "MZ_LOG_FILTER".to_string(),
-                        value: Some("debug".to_string()),
+                        value: Some("trace".to_string()),
                         value_from: None,
                     }]),
                     ..Default::default()

@@ -44,7 +44,7 @@ use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::PersistConfig;
 use mz_service::client::{GenericClient, Partitioned};
 use mz_service::local::LocalClient;
-use tracing::log::trace;
+use tracing::log::{trace,debug};
 
 use crate::communication::initialize_networking;
 use crate::compute_state::ActiveComputeState;
@@ -99,7 +99,7 @@ pub type TimelyContainerRef = Arc<Mutex<Option<TimelyContainer>>>;
 pub fn serve(
     config: Config,
 ) -> Result<(TimelyContainerRef, impl Fn() -> Box<dyn ComputeClient>), Error> {
-    trace!("Initiating timely server");
+    debug!("Initiating timely server");
     // Various metrics related things.
     let trace_metrics = TraceMetrics::register_with(&config.metrics_registry);
 

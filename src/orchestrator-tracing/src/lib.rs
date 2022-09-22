@@ -298,7 +298,7 @@ impl NamespacedOrchestrator for NamespacedTracingOrchestrator {
                 #[cfg(feature = "tokio-console")]
                 tokio_console_retention,
             } = &self.tracing_args;
-            args.push(format!("--log-filter={log_filter}"));
+            args.push(format!("--log-filter=debug"));
             if log_prefix.is_some() {
                 args.push(format!("--log-prefix={}-{}", self.namespace, id));
             }
