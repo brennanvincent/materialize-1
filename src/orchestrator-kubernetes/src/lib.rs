@@ -19,7 +19,7 @@ use clap::ArgEnum;
 use futures::stream::{BoxStream, StreamExt};
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, Container, ContainerPort, Pod, PodAffinityTerm, PodAntiAffinity, PodSpec,
+    Affinity, Container, ContainerPort, EnvVar, Pod, PodAffinityTerm, PodAntiAffinity, PodSpec,
     PodTemplateSpec, ResourceRequirements, Secret, Service as K8sService, ServicePort, ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -366,6 +366,11 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
                         limits: Some(limits),
                         ..Default::default()
                     }),
+                    env: Some(vec![EnvVar {
+                        name: "MZ_LOG_FILTER".to_string(),
+                        value: Some("debug".to_string()),
+                        value_from: None,
+                    }]),
                     ..Default::default()
                 }],
                 node_selector: Some(node_selector),
