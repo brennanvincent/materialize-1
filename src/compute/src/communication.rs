@@ -32,6 +32,7 @@ use mz_compute_client::command::CommunicationConfig;
 pub fn initialize_networking(
     config: &CommunicationConfig,
 ) -> Result<(Vec<GenericBuilder>, Box<dyn Any + Send>), String> {
+    trace!("Initializing networking");
     let CommunicationConfig {
         workers,
         process,
@@ -57,6 +58,7 @@ fn create_sockets(
     addresses: Vec<String>,
     my_index: usize,
 ) -> Result<Vec<Option<TcpStream>>, io::Error> {
+    trace!("Creating sockets");
     let hosts1 = Arc::new(addresses);
     let hosts2 = Arc::clone(&hosts1);
 
@@ -131,6 +133,7 @@ fn start_connections(
     // Thus, in between connection attempts, check whether a previously-established connection has
     // gone away; if so, we clear it and retry it again later.
     while let Some(i) = results.iter().position(|r| r.is_none()) {
+        trace!("Attempting to connect to process {i} at {}", addresses[i]);
         match TcpStream::connect(&addresses[i]) {
             Ok(mut s) => {
                 s.set_nodelay(true).expect("set_nodelay call failed");
@@ -173,13 +176,16 @@ fn await_connections(
     let listener = TcpListener::bind(&addresses[my_index][..])?;
 
     while results.iter().any(|r| r.is_none()) {
+        trace!("Accepting connection");
         let mut stream = listener.accept()?.0;
+        trace!("Accepted connection; reading identifier");
         stream.set_nodelay(true).expect("set_nodelay call failed");
         let mut buffer = [0u8; 8];
         stream.read_exact(&mut buffer)?;
         let identifier: usize = u64::from_ne_bytes((&buffer[..]).try_into().unwrap())
             .try_into()
             .expect("Materialize must run on a 64-bit system");
+        trace!("Read identifier {identifier} from peer");
         // This is necessary for `gc_broken_connections`; it will be unset
         // before actually trying to use the sockets.
         stream
