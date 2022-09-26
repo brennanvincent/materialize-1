@@ -107,11 +107,12 @@ where
 #[async_trait]
 impl<G, C, R> GenericClient<C, R> for GrpcClient<G>
 where
-    C: RustType<G::PC> + Send + Sync + 'static,
-    R: RustType<G::PR> + Send + Sync + 'static,
+    C: RustType<G::PC> + Send + Sync + Debug + 'static,
+    R: RustType<G::PR> + Send + Sync + Debug + 'static,
     G: BidiProtoClient,
 {
     async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
+        debug!("GRPC send: {cmd:?}");
         self.tx.send(cmd.into_proto())?;
         Ok(())
     }
@@ -119,7 +120,11 @@ where
     async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
         match self.rx.try_next().await? {
             None => Ok(None),
-            Some(response) => Ok(Some(response.into_rust()?)),
+            Some(response) => {
+                let rust = response.into_rust()?;
+                debug!("GRPC recv: {rust:?}");
+                Ok(Some(rust))
+            },
         }
     }
 }
