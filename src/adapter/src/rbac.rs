@@ -132,7 +132,8 @@ pub fn check_command(catalog: &Catalog, cmd: &Command) -> Result<(), Unauthorize
         | Command::CopyRows { .. }
         | Command::GetSystemVars { .. }
         | Command::SetSystemVars { .. }
-        | Command::Terminate { .. } => Ok(()),
+        | Command::Terminate { .. }
+        | Command::RetireExecute { .. } => Ok(()),
     }
 }
 
@@ -1163,7 +1164,11 @@ fn generate_required_privileges(
         | Plan::AlterSystemSet(AlterSystemSetPlan { name: _, value: _ })
         | Plan::AlterSystemReset(AlterSystemResetPlan { name: _ })
         | Plan::AlterSystemResetAll(AlterSystemResetAllPlan {})
-        | Plan::Declare(DeclarePlan { name: _, stmt: _ })
+        | Plan::Declare(DeclarePlan {
+            name: _,
+            stmt: _,
+            sql: _,
+        })
         | Plan::Fetch(FetchPlan {
             name: _,
             count: _,
@@ -1174,6 +1179,7 @@ fn generate_required_privileges(
             name: _,
             stmt: _,
             desc: _,
+            sql: _,
         })
         | Plan::Execute(ExecutePlan { name: _, params: _ })
         | Plan::Deallocate(DeallocatePlan { name: _ })
